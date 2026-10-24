@@ -12,6 +12,8 @@ Big open models need a big GPU. Kaggle and Colab lend you one for free, but only
 - **Locked with a key.** Every request needs the key the notebook prints.
 - **Two ways to chat:** a single-file web app, or a terminal client with no dependencies.
 
+**[⬇ Download everything (DOWNLOAD ME.zip)](https://github.com/zamsonl/no-gpu-local-ai/raw/main/DOWNLOAD%20ME.zip)**: the Kaggle and Colab notebooks, the chat app and the terminal client, with a START HERE file. Then follow the steps below.
+
 ## How it works
 
 ```
@@ -33,7 +35,8 @@ Ready to chat about four to six minutes after you press Run, every session. Free
 
 Kaggle gives every verified account 30 GPU hours a week on two T4s (30 GB of GPU memory between them), and sessions of up to 12 hours.
 
-1. Sign in to [Kaggle](https://www.kaggle.com) and verify your phone number (Settings → Phone verification). Without it you get no GPU and no internet in notebooks.
+1. Sign in to [Kaggle](https://www.kaggle.com) and verify your phone number (**Settings → Phone verification**). Without it you get no GPU and no internet in notebooks.
+   Kaggle's phone verification often fails: the code never arrives, or it says "too many requests". Don't keep retrying. Submit a request on Kaggle's help form at [kaggle.com/contact](https://www.kaggle.com/contact) and ask them to verify your account.
 2. Open the notebook: **[Open in Kaggle](https://www.kaggle.com/kernels/welcome?src=https://github.com/zamsonl/no-gpu-local-ai/blob/main/notebooks/kaggle.ipynb)** imports it for you. Or choose **Create → New Notebook**, then **File → Import Notebook**, and upload [notebooks/kaggle.ipynb](notebooks/kaggle.ipynb).
 3. In the notebook's side panel (**Settings**), set **Accelerator** to **GPU T4 x2** and turn **Internet** on.
 4. Optional: to keep the same key every session, add a secret under **Add-ons → Secrets** named `NO_GPU_KEY` with any long random value, and attach it to the notebook.
@@ -121,6 +124,7 @@ Pictures work when the model can see them: the app checks, and only then accepts
 | --- | --- |
 | `No GPU found` | Kaggle: Settings → Accelerator → GPU T4 x2. Colab: Runtime → Change runtime type → T4 GPU. |
 | Install or download fails | Kaggle: turn Internet on (needs a verified phone number). |
+| Phone verification won't work | Common on Kaggle. Stop retrying and ask Kaggle to verify you through [kaggle.com/contact](https://www.kaggle.com/contact). |
 | The app says **Offline** | The session ended or went idle. Run the notebook again and open the new link. |
 | The app says **Wrong key** | You opened an old link. Use the newest one, or set the `NO_GPU_KEY` secret so the key stays the same. |
 | Replies are slow | The model spilled onto the CPU. Set a smaller `CONTEXT`, or pick a smaller model or quant. |

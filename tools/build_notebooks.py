@@ -59,7 +59,7 @@ This notebook runs a large open model on Kaggle's free GPUs (two T4s, with 30 GB
 
 **Before the first run**
 
-1. Use a Kaggle account with a verified phone number (account Settings, then Phone verification). Kaggle only gives GPUs and internet access to verified accounts.
+1. Use a Kaggle account with a verified phone number (account Settings, then Phone verification). Kaggle only gives GPUs and internet access to verified accounts. Kaggle's phone verification often fails (no code arrives, or it says too many requests): don't keep retrying, submit a request on Kaggle's help form at https://www.kaggle.com/contact and ask them to verify your account.
 2. In the notebook's **Settings** panel, set **Accelerator** to **GPU T4 x2** and turn **Internet** on.
 3. Optional: to keep the same key from one session to the next, open **Add-ons → Secrets**, add a secret named `NO_GPU_KEY` with any long random value, and attach it to this notebook. Without it you get a new key every session.
 
