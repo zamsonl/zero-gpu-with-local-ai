@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+node_modules/
+# local test output
+.test-output/
+*.log
