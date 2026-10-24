@@ -77,6 +77,16 @@ node cli/chat.mjs "https://zamsonl.github.io/no-gpu-local-ai/web/#server=...&key
 
 Paste the whole link the notebook printed. After the first time, `node cli/chat.mjs` reconnects to the last server. Type `/help` for commands (new chat, switch chats, think level, attach a file or picture, shut the server down).
 
+## Your chats
+
+Everything you send and every reply is saved automatically, in your own browser.
+
+- **What's kept:** the whole conversation, with the model's reasoning and any pictures or files you attached. It's saved while the reply streams in, so reloading mid-answer loses nothing.
+- **Where:** your browser's own storage (IndexedDB), on that device. Nothing is written into the `index.html` file, nothing goes to GitHub or to the author, and the notebook keeps nothing.
+- **One history per browser:** another browser, another device or a private window starts empty, and the hosted copy and a local `index.html` each keep their own. A private window forgets everything when it closes, and clearing your browser's site data deletes your chats.
+- **Backing up and moving:** **Settings → Your chats → Export all** saves a file. **Import** loads it in another browser, or in the terminal client.
+- **Terminal client:** keeps its chats as files in `~/.no-gpu-local-ai/chats/`, in the same format.
+
 ## Choose a model
 
 Everything is set in the notebook's first cell:
@@ -114,7 +124,7 @@ Pictures work when the model can see them: the app checks, and only then accepts
 
 - **Your key is the lock.** Anyone with the link can use your server until the session ends. Do not post the link. A notebook made public on Kaggle also makes its run logs public, and the logs contain the link, so keep the notebook private (the default).
 - **The tunnel address is public but random.** Without the key it only answers with a short note on how to send one.
-- **Chats live in your browser** (IndexedDB), so they survive reloads but don't follow you to another device. **Settings → Your chats** has export, import and delete; an export moves chats between devices and into the terminal client, which keeps its own in `~/.no-gpu-local-ai/`.
+- **Chats live in your browser**, never on the notebook or anywhere else. See [Your chats](#your-chats).
 - **The model is uncensored.** It will not refuse, so what it produces is on you. You can swap in a regular model with `MODEL`.
 - **Free tiers have rules.** Use this for your own interactive use. Do not run it as a service for other people, and do not use several accounts to get around limits.
 
