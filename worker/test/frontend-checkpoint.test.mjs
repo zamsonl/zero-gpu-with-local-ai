@@ -94,6 +94,16 @@ test('the elapsed work budget finishes from saved work rather than asking for an
   await f.send('task');assert.equal(f.calls.continue.length,1);assert.equal(f.calls.continue[0].think,false);
 });
 
+test('a checkpoint after nearly two hours still permits only one answer pass even when it returns no progress',async context=>{
+  context.mock.timers.enable({apis:['Date'],now:1_800_000_000_000});
+  const f=fixture({turn:async function*(){yield start();context.mock.timers.tick(2*60*60*1000-1000);yield checkpoint();},
+    continuation:async function*(){yield {event:'start',chat};yield checkpoint();}});
+  await f.send('task');
+  assert.equal(f.calls.continue.length,1);assert.equal(f.calls.continue[0].think,false);
+  assert.equal(f.state.messages.filter(message=>message.id===99).length,1);
+  assert.match(f.calls.finish.at(-1).options.errorText,/answer-only pass/);
+});
+
 test('Answer now waits for the durable stopped reply then finishes the same ID without changing the chosen mode',async()=>{
   const f=fixture({turn:async function*(env){yield start();yield {event:'thinking',text:'initial work'};await env.answerNow();assert.equal(env.state.generation.answerRequested,true);yield {event:'done',chat,stopped_by:'another_device',message:saved('initial work',{status:'stopped'})};}});
   await f.send('task');assert.equal(f.calls.apiStop,1);assert.equal(f.calls.turn.length,1);assert.equal(f.calls.continue.length,1);assert.equal(f.calls.continue[0].think,false);assert.equal(f.composer.think,'medium');assert.equal(f.state.messages.at(-1).id,99);assert.equal(f.env.els.answerNow.hidden,true);

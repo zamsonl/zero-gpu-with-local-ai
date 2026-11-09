@@ -35,6 +35,27 @@ test('bootstrap failures never echo a token or follow an owner fallback path',as
   }
   await assert.rejects(createOwnKaggleSession({token:TOKEN,consent:true,fetcher:async()=>{throw new Error(TOKEN);}}),error=>!error.message.includes(TOKEN)&&error.message.includes('--launch-id'));
 });
+
+test('provider refusals retain safe operation/status while connector cooldowns stay distinct',async()=>{
+  for(const remote of [
+    {code:'kaggle_refused',origin:'kaggle',operation:'SaveKernel',upstream_status:403,category:'dataset_access',launch_uncertain:false},
+    {code:'kaggle_rate_limit',origin:'kaggle',operation:'SaveKernel',upstream_status:429,category:'gpu_quota',launch_uncertain:false},
+    {code:'personal_launch_limit',origin:'connector',limit_kind:'daily',retry_after_seconds:83,launch_uncertain:false},
+    {code:'personal_retry_cooldown',origin:'connector',retry_after_seconds:12,launch_uncertain:false},
+  ]){
+    const status=remote.code==='kaggle_refused'?502:429;
+    await assert.rejects(createOwnKaggleSession({token:TOKEN,consent:true,now:NOW,fetcher:async()=>Response.json({error:{...remote,message:TOKEN}},{status})}),error=>{
+      assert.equal(error.code,remote.code);assert.equal(error.launchUncertain,false);assert(!error.message.includes(TOKEN));assert(!error.message.includes('Forget'));
+      if(remote.origin==='kaggle'){assert.match(error.message,/Kaggle refused SaveKernel/);assert.equal(error.upstreamStatus,remote.upstream_status);}else assert.match(error.message,/connector/i);
+      return true;
+    });
+  }
+});
+
+test('accepted but unconfirmed session state survives local validation for precise startup logs',()=>{
+  assert.equal(validatePersonalSession({...session(),launch_state:'unknown'},{now:NOW}).launch_state,'unknown');
+  assert.equal(validatePersonalSession({...session(),launch_state:TOKEN},{now:NOW}).launch_state,undefined);
+});
 test('shutdown can target only the validated personal namespace',async()=>{
   let called;await requestOwnShutdown(session(),{fetcher:async(url,options)=>{called={url,options};return response({ok:true});}});
   assert.equal(called.url,session().relay+'/v1/server/shutdown');assert.equal(called.options.headers['x-relay-key'],session().key);assert.equal(called.options.redirect,'error');

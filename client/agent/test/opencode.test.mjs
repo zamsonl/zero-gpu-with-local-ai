@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {RELAY_ORIGIN} from '../kaggle-session.mjs';
-import {createOpenCodeConfig,createOpenCodeRuntime,cleanChildEnvironment,isolatedEnvironment,assertNoManagedOpenCode,initializeThinkingVisibility,OPEN_CODE_REQUEST_TIMEOUT_MS,MODEL,MODEL_ID,PROVIDER_ID,RELAY_KEY_ENV,OPENCODE_VERSION} from '../opencode-config.mjs';
+import {createOpenCodeConfig,createOpenCodeRuntime,cleanChildEnvironment,isolatedEnvironment,assertNoManagedOpenCode,initializeThinkingVisibility,OPEN_CODE_REQUEST_TIMEOUT_MS,OPEN_CODE_TRANSPORT_TIMEOUT_MS,MODEL,MODEL_ID,PROVIDER_ID,RELAY_KEY_ENV,OPENCODE_VERSION} from '../opencode-config.mjs';
 import {launchOpenCode,parseOpenCodeOptions,resolveOpenCode,installLocalTools,waitForOwnReady,chooseBrowserChannel,preflightBrowser,browserRuntimeAvailable,openKaggleTokenPage,KAGGLE_TOKEN_SETTINGS_URL,confirmSetupStep} from '../opencode.mjs';
 
 const TOKEN='KGAT_test_personal_token_123456789012345';
@@ -26,7 +26,8 @@ test('the generated config allows only personal Qwen for every AI role and state
   assert(config.agent.compaction.prompt.includes('later corrections'));assert(config.agent.compaction.prompt.includes('commands and test results'));
   assert.equal(provider.models[MODEL_ID].tool_call,true);assert.equal(provider.models[MODEL_ID].attachment,false);
   assert.equal(provider.models[MODEL_ID].reasoning,true);assert.deepEqual(provider.models[MODEL_ID].interleaved,{field:'reasoning_content'});
-  assert.equal(provider.models[MODEL_ID].options.reasoningEffort,'medium');assert.equal(provider.options.timeout,2*60*60*1000);assert.equal(OPEN_CODE_REQUEST_TIMEOUT_MS,provider.options.timeout);
+  assert.equal(provider.models[MODEL_ID].options.reasoningEffort,'medium');assert.equal(OPEN_CODE_REQUEST_TIMEOUT_MS,2*60*60*1000);
+  assert.equal(OPEN_CODE_TRANSPORT_TIMEOUT_MS,OPEN_CODE_REQUEST_TIMEOUT_MS+30_000);assert.equal(provider.options.timeout,OPEN_CODE_TRANSPORT_TIMEOUT_MS);
   for(const name of ['build','plan','general','explore','title','summary','compaction'])assert.equal(config.agent[name].model,MODEL);
   for(const name of ['title','summary','compaction'])assert.equal(config.agent[name].reasoningEffort,'none');
   for(const name of ['build','plan','general','explore'])assert.equal(config.agent[name].reasoningEffort,undefined);

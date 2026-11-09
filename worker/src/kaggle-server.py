@@ -843,7 +843,7 @@ def serve(context, vision, quant, url):
     mode = "chat"
 
     def register(url):
-        relay("POST", "/_relay/register", {"target": url, "host": RUNTIME_HOST, "num_ctx": context, "num_batch": BATCH_SIZE, **({"profile_id": PROFILE_ID} if PROFILE_ID else {}), **({"job_max_leg_seconds": 300, "job_control": True} if AGENT_ONLY else {}), "inference_transport": "jobs-v1", "vision": vision, "quant": quant, "control": True, "mode": mode})
+        relay("POST", "/_relay/register", {"target": url, "host": RUNTIME_HOST, "num_ctx": context, "num_batch": BATCH_SIZE, **({"profile_id": PROFILE_ID} if PROFILE_ID else {}), "job_max_leg_seconds": 300, **({"job_control": True} if AGENT_ONLY else {}), "inference_transport": "jobs-v1", "vision": vision, "quant": quant, "control": True, "mode": mode})
         log(f"READY at {url}: {context // 1024}K context, pictures {'on' if vision else 'off'}, {quant}")
 
     report("connecting", "Connecting to this page")
@@ -859,7 +859,10 @@ def serve(context, vision, quant, url):
     while time.time() - STARTED < MAX_RUNTIME_S:
         time.sleep(IMAGE_POLL_S if mode == "images" else CHAT_POLL_S)
         now_served = requests_served()
-        if now_served != served or gpu_busy():
+        jobs = globals().get("PERSONAL_JOBS") if AGENT_ONLY else globals().get("OWNER_JOBS")
+        # An accepted request is activity even during quiet CPU/prompt prefill.
+        # Its own polling/runtime reapers still cancel an abandoned or expired job.
+        if now_served != served or (jobs and jobs.busy()) or gpu_busy():
             served = now_served
             last_used = time.time()
 
@@ -987,10 +990,10 @@ def main():
     # Job envelopes add a small identity/path wrapper around the original 4 MiB payload.
     proxy = start_stream_proxy(OLLAMA, port=11435, max_request_bytes=4 * 1024 * 1024 + 1024)
     try:
-        global PERSONAL_JOBS
+        global PERSONAL_JOBS, OWNER_JOBS
         PERSONAL_JOBS = install_async_job_routes(proxy, max_job_seconds=7200, max_stream_seconds=300, control_token=LAUNCH_TOKEN) if AGENT_ONLY else None
         if not AGENT_ONLY:
-            install_async_job_routes(proxy)
+            OWNER_JOBS = install_async_job_routes(proxy, max_job_seconds=7200, max_stream_seconds=300)
         tunnel = Background(start_tunnel)
         report("loading", "Loading the model onto the GPUs")
         context = load_best()

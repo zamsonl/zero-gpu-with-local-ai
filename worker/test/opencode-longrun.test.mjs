@@ -131,7 +131,23 @@ test('cancellation and the original two-hour deadline cannot start a recovery',a
   const cancelled=await fixture({signal:caller.signal,run:async function*(){caller.abort();yield {value:{error:runnerError},upstreamStatus:200};}});
   assert.equal(cancelled.calls.length,1);assert.equal(cancelled.value.error.code,'cancelled');assert.equal(cancelled.timers.size,0);
   const expired=await fixture({run:async function*({advance}){advance(REQUEST_MS);yield {value:{error:runnerError},upstreamStatus:200};}});
-  assert.equal(expired.calls.length,1);assert.equal(expired.value.error.code,'model_timeout');assert.equal(expired.timers.size,0);
+  assert.equal(expired.calls.length,1);assert.equal(expired.response.status,400);assert.equal(expired.value.error.code,'model_timeout');assert.equal(expired.timers.size,0);
+});
+
+test('unchanged cross-step tool loops stop before any executable delta and cannot start model recovery',async()=>{
+  const messages=[{role:'user',content:'Inspect src/a.ts.'}];
+  for(let i=0;i<3;i++)messages.push(
+    {role:'assistant',content:'Next step '+i,reasoning_content:'Keep the unfinished plan.',tool_calls:[{id:'read_'+i,type:'function',function:{name:'read_file',arguments:'{"path":"src/a.ts"}'}}]},
+    {role:'tool',tool_call_id:'read_'+i,content:'The same verified file contents.'});
+  for(const stream of [false,true]){
+    const f=await fixture({extra:{messages,stream,tools:[tool]},run:async function*(){
+      yield {value:packet({thinking:'Read the same file again.',tool_calls:[{function:{name:'read_file',arguments:{path:'src/a.ts'}}}]}),upstreamStatus:200};
+      yield {value:done(),upstreamStatus:200};
+    }});
+    assert.equal(f.calls.length,1,'A stalled tool loop must not launch a recovery job');assert.equal(f.timers.size,0);
+    if(stream){assert.equal(f.events.find(event=>event.error)?.error.code,'tool_progress_stalled');assert(!f.events.some(event=>event.choices?.[0]?.delta?.tool_calls));assert(!f.events.some(event=>event.choices?.[0]?.finish_reason));}
+    else{assert.equal(f.response.status,400);assert.equal(f.value.error.code,'tool_progress_stalled');assert.equal(f.value.choices,undefined);}
+  }
 });
 
 test('tool calls held before a model failure are never executed, streamed or copied into a retry',async()=>{

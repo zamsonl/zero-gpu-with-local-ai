@@ -12,13 +12,19 @@ export const OPENCODE_OUTPUT=8192;
 export const OPENCODE_REQUEST_MS=2*60*60_000;
 export const OPENCODE_JOB_LEG_SECONDS=300;
 const MAX_BODY=2*1024*1024, MAX_OUTPUT=1024*1024, MAX_CALLS=128;
+// Even the shortest valid message occupies more than 16 JSON bytes. This
+// defensive parser bound cannot reject a real request below the 2 MiB wire
+// limit; token usage, not the number of small tool rounds, drives compaction.
+const MAX_MESSAGES=Math.floor(MAX_BODY/16);
 const NAME=/^[A-Za-z0-9_-]{1,64}$/, CALL_ID=/^[A-Za-z0-9_.:-]{1,200}$/;
 const validName=value=>typeof value==='string'&&NAME.test(value);
 const validCallId=value=>typeof value==='string'&&CALL_ID.test(value);
 const encoder=new TextEncoder();
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 const invalid=message=>new HttpError(400,'invalid_request_error',message);
-const requestTimeout=()=>new HttpError(504,'model_timeout','Your personal Qwen request reached the two-hour time limit.');
+// A spent request budget is terminal. OpenCode retries HTTP 504 automatically,
+// which would restart a nonstream title/summary with a fresh two-hour budget.
+const requestTimeout=()=>new HttpError(400,'model_timeout','Your personal Qwen request reached the two-hour time limit.');
 
 function textContent(content,optional=false){
   if(content==null&&optional)return '';
@@ -70,7 +76,7 @@ export function parseOpenCodeRequest(body){
       return {type:'function',function:{name:fn.name,...(fn.description!==undefined?{description:fn.description}:{}),parameters:fn.parameters}};
     });
   }
-  if(!Array.isArray(body.messages)||!body.messages.length||body.messages.length>1000)throw invalid('Expected 1–1000 messages.');
+  if(!Array.isArray(body.messages)||!body.messages.length||body.messages.length>MAX_MESSAGES)throw invalid('Expected a non-empty message array within the request-size limit.');
   const pending=new Map(),ids=new Set();
   const messages=body.messages.map(message=>{
     if(!object(message)||!['system','developer','user','assistant','tool'].includes(message.role))throw invalid('Invalid message role.');
@@ -178,6 +184,48 @@ function workingCheckpoint(result,historical=false){
   // unverified notes, not tool results or permission to execute an earlier call.
   const prefix=historical?'Saved working notes for this earlier assistant message. Plans and guesses are unverified; native tool calls and subsequent actual tool results establish what ran. Notes alone are not proof of execution.':'Unfinished working notes from this response. Plans and guesses below are unverified; only actual tool results in the preceding conversation establish completed actions. No tool call from these notes has been released.';
   return {role:'assistant',content:prefix+'\n'+JSON.stringify({reasoning:result.reasoning,answer_so_far:result.content})};
+}
+
+const TOOL_LOOP_REPEATS=3,TOOL_LOOP_PERIOD=8;
+const canonicalJson=value=>JSON.stringify(value,(_key,item)=>object(item)?Object.fromEntries(Object.keys(item).sort().map(key=>[key,item[key]])):item);
+function toolActions(calls){
+  return canonicalJson(calls.map(call=>{
+    const fn=call.function,args=typeof fn.arguments==='string'?argumentsObject(fn.arguments):fn.arguments;
+    // Native bash's description only labels the UI. Renaming that label does
+    // not turn the same command into progress; other execution options count.
+    const parameters=fn.name==='bash'?Object.fromEntries(Object.entries(args).filter(([key])=>key!=='description')):args;
+    return {name:fn.name,arguments:parameters};
+  }));
+}
+
+/** Stop unchanged tool cycles across assistant messages, before releasing tools. */
+export function assertOpenCodeToolProgress(messages,calls){
+  if(!calls.length)return;
+  // A real new user instruction permits an intentional retry. Assistant prose,
+  // reasoning and changing generated call IDs cannot reset the progress guard.
+  const start=messages.findLastIndex(message=>message.role==='user')+1;
+  const rounds=[];let pending=null;
+  for(let index=start;index<messages.length;index++){
+    const message=messages[index];
+    if(message.role==='assistant'&&message.tool_calls?.length)pending={calls:message.tool_calls,results:new Map()};
+    else if(message.role==='tool'&&pending){
+      pending.results.set(message.tool_call_id,message.content);
+      if(pending.results.size===pending.calls.length){
+        const actions=toolActions(pending.calls);
+        rounds.push({actions,signature:canonicalJson([actions,pending.calls.map(call=>pending.results.get(call.id))])});
+        if(rounds.length>TOOL_LOOP_REPEATS*TOOL_LOOP_PERIOD)rounds.shift();
+        pending=null;
+      }
+    }
+  }
+  const proposed=toolActions(calls);
+  for(let period=1;period<=TOOL_LOOP_PERIOD&&period*TOOL_LOOP_REPEATS<=rounds.length;period++){
+    const offset=rounds.length-period*TOOL_LOOP_REPEATS;
+    if(proposed!==rounds[offset].actions)continue;
+    if(rounds.slice(offset+period).every((round,index)=>round.signature===rounds[offset+index%period].signature)){
+      throw new HttpError(400,'tool_progress_stalled','Qwen requested the same tool cycle again after three unchanged results. No tools from this response were released. Review the completed tool results and give a new instruction to continue.');
+    }
+  }
 }
 
 // Metadata and summary calls must not erase a failing main turn's streak. This
@@ -368,6 +416,10 @@ export async function openCodeChat({request,env,ctx,ensureActive=async()=>{}}){
           abort.signal.throwIfAborted();
           if(part.upstreamStatus!==null&&part.upstreamStatus>=300)throw modelFailure(modelRecordError(part.value.error||'Model HTTP error.'),true);
           const deltas=result.consume(part.value);
+          // OpenCode 1 checks doom_loop within one assistant message, so it
+          // misses one-tool-per-step loops. Check the actual completed history
+          // here, after terminal validation and before any executable delta.
+          if(result.done&&result.calls.length)assertOpenCodeToolProgress(parsed.body.messages,result.calls);
           for(const delta of deltas)if(events)await events.send(chunk(delta));
           if(result.done)break;
         }

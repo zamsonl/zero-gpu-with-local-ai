@@ -25,7 +25,7 @@ import {
   recordIdle,
   writeBoot,
 } from "./server-control.js";
-import { HOSTS, clearTarget, readTarget, validBatch, validProfileId, validModelSize, validInferenceTransport, writeTarget } from "./target.js";
+import { HOSTS, clearTarget, readTarget, validBatch, validProfileId, validModelSize, validInferenceTransport, validJobLegSeconds, writeTarget } from "./target.js";
 import { rawBatchDefault } from "./raw-options.js";
 import { eligibleJobPayload, jobResponse } from "./jobs-transport.js";
 import { reportImageProgress, reportImageResult, reportMode, resetForNewServer } from "./images.js";
@@ -103,7 +103,7 @@ async function body(request) {
 async function register(request, env, config) {
   const fields = await body(request);
   if (!fields) return text("bad target\n", 400);
-  const { target, host, num_ctx, vision, quant, control, mode, num_batch, profile_id, inference_transport, model_size } = fields;
+  const { target, host, num_ctx, vision, quant, control, mode, num_batch, profile_id, inference_transport, job_max_leg_seconds, model_size } = fields;
   if (typeof target !== "string" || !config.targetPattern.test(target)) return text("bad target\n", 400);
   if (host != null && !HOSTS.includes(host)) return text("bad host\n", 400);
   if (num_ctx != null && !(Number.isInteger(num_ctx) && num_ctx >= 2048 && num_ctx <= 262_144)) {
@@ -117,7 +117,8 @@ async function register(request, env, config) {
   if (num_batch != null && !validBatch(num_batch)) return text("bad num_batch\n", 400);
   if (profile_id != null && !validProfileId(profile_id)) return text("bad profile_id\n", 400);
   if (inference_transport != null && !validInferenceTransport(inference_transport)) return text("bad inference_transport\n", 400);
-  await writeTarget(env.DB, { target, host, num_ctx, vision, quant, control, num_batch, profile_id, inference_transport, model_size });
+  if (job_max_leg_seconds != null && !validJobLegSeconds(job_max_leg_seconds)) return text("bad job_max_leg_seconds\n", 400);
+  await writeTarget(env.DB, { target, host, num_ctx, vision, quant, control, num_batch, profile_id, inference_transport, job_max_leg_seconds, model_size });
   // A notebook in image mode that registers again (its tunnel moved) carries on making pictures;
   // any other registration is a server starting afresh in chat mode.
   if (mode === "images") {

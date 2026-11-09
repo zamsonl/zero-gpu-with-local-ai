@@ -19,3 +19,11 @@ The sections below describe the optional full workspace.
 `client/agent/` owns Windows setup, secure token storage, reviewed local tool installation, private project/account OpenCode history, and local child-process lifecycle. Model calls pass through the configured relay to the user's private Kaggle notebook. All AI roles use the selected model. Terminal tools run as the OS user, with approval policy rather than a filesystem sandbox.
 
 The website model notebook and local-agent notebook are separate allocations and histories. Local-agent cache/session APIs do not use the website owner's private GPU, token or cache for other accounts. Website authentication is a workspace key rather than a multi-user identity system.
+
+### Long sessions
+
+Advanced web and OpenCode model jobs allow up to two hours, including prompt processing. Five-minute transport legs resume the same job and cursor rather than starting inference again. Active owner jobs keep the notebook's idle watcher awake. After updating, restart the model notebook and reopen the local helper to use the new runtime and client settings.
+
+Elapsed session time is different from context capacity. The selected model still has a finite token window; automatic compaction uses that same model and keeps the original transcript. Summaries are not a guarantee of perfect recall. Quick Start has no compaction and is not the long-memory path.
+
+Thinking windows, recovery attempts, repeated tool cycles and external connection calls are bounded. Exhausted budgets stop with saved progress rather than retrying forever. Platform shutdowns, lost connections and context or memory exhaustion can still interrupt work. The two-hour deadline is covered by simulated-time tests; it is not a guarantee of two hours of uninterrupted GPU availability.

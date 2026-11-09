@@ -506,7 +506,7 @@ async function launchOpenCodeInner(args,dependencies,context){
     session=validatePersonalSession(session,{requireFresh:false});
     startupToken=token;
     stage('token','complete','Kaggle accepted the token for '+session.owner+'.');
-    stage('queued','running','Kaggle accepted your private notebook. Waiting for its first startup report.',{owner:session.owner,notebookUrl:session.url,launchId:clientId});
+    stage('queued','running',session.launch_state==='unknown'||session.launch_state==='creating'?'Notebook submission is unconfirmed. Checking this same launch reference; another notebook will not be submitted.':'Kaggle accepted your private notebook. Waiting for its first startup report.',{owner:session.owner,notebookUrl:session.url,launchId:clientId});
     if(!cancelled()&&setup&&manualToken&&!options['--no-remember-token']&&(dependencies.secureStorageAvailable||secureTokenStorageAvailable)()){
       try{await(dependencies.saveSavedToken||saveKaggleToken)(token);log('Kaggle token accepted and remembered with Windows user encryption.');}
       catch{log('Your token was accepted but could not be remembered securely. This run can continue; enter it again next time. No plaintext token was saved.');}

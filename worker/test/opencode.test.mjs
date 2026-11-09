@@ -144,9 +144,9 @@ test('queue time is included in the same two-hour deadline and streaming output 
   const queued=await timingFixture({queueMs:8*60_000,run:async function*({options}){assert.equal(options.maxJobMs,OPENCODE_REQUEST_MS-8*60_000);yield {value:packet({content:'After queue.'}),upstreamStatus:200};yield {value:done(),upstreamStatus:200};}});
   assert.equal(queued.response.status,200);
   const expired=await timingFixture({run:async function*({advance,options}){advance(30*60_000);yield {value:packet({thinking:'Still thinking.'}),upstreamStatus:200};advance(90*60_000);assert.equal(options.signal.aborted,true);yield {value:done(),upstreamStatus:200};}});
-  assert.equal(expired.response.status,504);assert.equal(expired.value.error.code,'model_timeout');assert.match(expired.value.error.message,/two-hour/);assert.equal(expired.jobCalls,1);assert(expired.releases>0);assert.equal(expired.timers.size,0);
+  assert.equal(expired.response.status,400);assert.equal(expired.value.error.code,'model_timeout');assert.match(expired.value.error.message,/two-hour/);assert.equal(expired.jobCalls,1);assert(expired.releases>0);assert.equal(expired.timers.size,0);
   const waiting=await timingFixture({queueMs:OPENCODE_REQUEST_MS,run:async function*(){assert.fail('An expired queued request cannot start inference');}});
-  assert.equal(waiting.response.status,504);assert.equal(waiting.value.error.code,'model_timeout');assert.equal(waiting.jobCalls,0);
+  assert.equal(waiting.response.status,400);assert.equal(waiting.value.error.code,'model_timeout');assert.equal(waiting.jobCalls,0);
 });
 
 test('an older short-leg personal notebook is refused with a clear upgrade instruction before inference',async()=>{
@@ -351,7 +351,14 @@ test('repeated main overflows stop native recovery despite successful summaries;
     }
   };
   const success=async extra=>{plan=[{value:packet({content:'Saved notes or answer.'})},{value:done()}];const response=await chat(input(extra));assert.equal(response.status,200);await response.text();};
-  const overflow=async extra=>{plan=[{value:{error:'the input length exceeds the context length'}}];return chat(input(extra));};
+  // A long tool session must reach the tokenizer/compactor even after the old
+  // 1000-message ceiling, while retaining the same repeated-overflow guard.
+  const longMessages=[{role:'user',content:'Continue this long tool session.'}];
+  for(let i=0;i<500;i++)longMessages.push(
+    {role:'assistant',content:'Read next.',tool_calls:[{id:'long_'+i,type:'function',function:{name:'read_file',arguments:'{"path":"src/a.ts"}'}}]},
+    {role:'tool',tool_call_id:'long_'+i,content:'Verified file contents.'});
+  assert.equal(longMessages.length,1001);assert(Buffer.byteLength(JSON.stringify(input({messages:longMessages})))<2*1024*1024);
+  const overflow=async extra=>{plan=[{value:{error:'the input length exceeds the context length'}}];return chat(input({messages:longMessages,...extra}));};
   await success();assert.equal(await state(),null);
   let response=await overflow();assert.equal(response.status,413);assert.equal((await response.json()).error.code,'context_length_exceeded');assert.equal((await state()).count,1);
   await success({reasoning_effort:'none'});assert.equal((await state()).count,1,'successful summary cannot reset the main streak');

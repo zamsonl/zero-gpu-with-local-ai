@@ -13,6 +13,10 @@ export const MODEL_ID='qwen3.8-hauhau';
 export const MODEL=PROVIDER_ID+'/'+MODEL_ID;
 export const RELAY_KEY_ENV='QWEN_AGENT_RELAY_KEY';
 export const OPEN_CODE_REQUEST_TIMEOUT_MS=2*60*60*1000;
+// The gateway stops inference at two hours. Let its terminal SSE error and
+// saved-work status reach OpenCode before the SDK replaces them with a generic
+// client timeout; this grace never extends the model's shared request deadline.
+export const OPEN_CODE_TRANSPORT_TIMEOUT_MS=OPEN_CODE_REQUEST_TIMEOUT_MS+30_000;
 const THINKING_VISIBILITY_VERSION=1;
 
 export function credentialRules(defaultAction='allow',extraPaths=[]){
@@ -54,7 +58,7 @@ export function createOpenCodeConfig(session,{browserCommand,privatePaths=[]}={}
     plugin:[],instructions:[],lsp:false,formatter:false,experimental:{openTelemetry:false},
     provider:{[PROVIDER_ID]:{
       npm:'@ai-sdk/openai-compatible',name:custom?'Your private Kaggle model':'Your private Kaggle Qwen',
-      options:{baseURL:own.relay+'/v1',apiKey:'{env:'+RELAY_KEY_ENV+'}',timeout:OPEN_CODE_REQUEST_TIMEOUT_MS},
+      options:{baseURL:own.relay+'/v1',apiKey:'{env:'+RELAY_KEY_ENV+'}',timeout:OPEN_CODE_TRANSPORT_TIMEOUT_MS},
       models:{[MODEL_ID]:{
         name:profile?.label||'Qwen 27B · your Kaggle GPU',tool_call:true,attachment:false,reasoning:custom?profile.thinking===true:true,
         interleaved:{field:'reasoning_content'},options:{reasoningEffort:'medium'},

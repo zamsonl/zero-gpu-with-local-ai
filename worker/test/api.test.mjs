@@ -423,6 +423,26 @@ describe("open stack", () => {
       assert.equal((await call(open, "GET", "/v1/status")).json.vision, false);
     });
 
+    test("owner jobs registration preserves supported stream caps and rejects invalid metadata", async () => {
+      for (const cap of [0, 121, 301, "300"]) {
+        const invalid = await call(open, "POST", "/_relay/register", { body: { target: open.mock.url, inference_transport: "jobs-v1", job_max_leg_seconds: cap }, headers: withKey });
+        assert.equal(invalid.status, 400);
+        assert.equal(invalid.text, "bad job_max_leg_seconds\n");
+      }
+      try {
+        for (const cap of [120, 300]) {
+          const response = await call(open, "POST", "/_relay/register", { body: { target: open.mock.url, inference_transport: "jobs-v1", job_max_leg_seconds: cap }, headers: withKey });
+          assert.equal(response.status, 200);
+          const status = (await call(open, "GET", "/_relay/status", { headers: withKey })).json;
+          assert.equal(status.job_max_leg_seconds, cap);
+          assert.equal(status.inference_transport, "jobs-v1");
+        }
+      } finally {
+        await register(open, open.mock.url);
+      }
+      assert.equal((await call(open, "GET", "/_relay/status", { headers: withKey })).json.job_max_leg_seconds, undefined);
+    });
+
     test("start-up progress shows until the new server registers", async () => {
       const progress = (body, headers = withKey) => call(open, "POST", "/_relay/progress", { body, headers });
       assert.equal((await progress({ host: "kaggle", stage: "baking" })).text, "bad stage\n");

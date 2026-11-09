@@ -16,7 +16,7 @@ const accounts=new Map([[ALICE,'alice'],[BOB,'bob']]);
 const clientIds={alice:randomUUID(),bob:randomUUID()};
 const action={action:'answer',message:'Personal Qwen fixture complete.',path:'',content:'',command:'',query:'',offset:0};
 let stack,kaggleServer,aliceModel,bobModel,aliceProxy,bobProxy,alice,bob;
-const pushes=[],calls=[],statuses=new Map(),lostSaveAck=new Set();
+const pushes=[],calls=[],statuses=new Map(),lostSaveAck=new Set(),saveRefusals=new Map();
 async function personalKaggle(req,res){
   let raw='';for await(const chunk of req)raw+=chunk;
   const body=JSON.parse(raw||'{}');const token=(req.headers.authorization||'').replace(/^Bearer /,'');
@@ -24,8 +24,8 @@ async function personalKaggle(req,res){
   const respond=(value,status=200)=>{res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(value));};
   if(!owner)return respond({message:'Rejected supplied test credential.'},401);
   if(req.url.endsWith('/IntrospectToken'))return respond({active:body.token===token,username:owner});
-  if(req.url.endsWith('/SaveKernel')){pushes.push({owner,body});if(lostSaveAck.delete(owner)){req.socket.destroy();return;}return respond({versionNumber:1,url:`https://www.kaggle.com/code/${body.slug}`});}
-  if(req.url.endsWith('/GetKernelSessionStatus'))return respond({status:statuses.get(body.kernelSlug)||'RUNNING'});
+  if(req.url.endsWith('/SaveKernel')){pushes.push({owner,body});if(lostSaveAck.delete(owner)){req.socket.destroy();return;}const refused=saveRefusals.get(owner);if(refused)return respond(refused.body||{error:{code:refused.status,message:'Dataset permission refused '+token}},refused.status);return respond({versionNumber:1,url:`https://www.kaggle.com/code/${body.slug}`});}
+  if(req.url.endsWith('/GetKernelSessionStatus')){const status=statuses.has(body.kernelSlug)?statuses.get(body.kernelSlug):'RUNNING';return typeof status==='object'?respond({error:{message:'Fixture lookup unavailable'}},status.http):respond({status});}
   return respond({message:'No such mocked Kaggle method'},404);
 }
 const jsonRequest=(url,body,headers={})=>fetch(url,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
@@ -256,4 +256,59 @@ test('lost SaveKernel acknowledgement preserves launch identity without automati
   const token='KGAT_test_dave_012345678901234567890123';accounts.set(token,'dave');lostSaveAck.add('dave');const launchId=randomUUID();const before=pushes.length;
   const first=await bootstrap(token,launchId);assert.equal(first.status,202);const session=await first.json();assert.equal(session.launch_state,'unknown');assert.equal(pushes.length,before+1);
   const retry=await bootstrap(token,launchId);assert.equal(retry.status,200);const recovered=await retry.json();assert.equal(recovered.session_id,session.session_id);assert.equal(recovered.key,session.key);assert.equal(pushes.length,before+1);
+});
+
+async function failedLaunchFixture(owner,{refusalBody}={}){
+  const token='KGAT_'+owner+'_012345678901234567890123';accounts.set(token,owner);saveRefusals.set(owner,{status:400,...(refusalBody?{body:refusalBody}:{})});
+  const response=await bootstrap(token,randomUUID());assert.equal(response.status,502);
+  const error=(await response.json()).error;assert.equal(error.upstream_status,400);assert.equal(error.origin,'kaggle');assert.equal(error.launch_uncertain,false);assert(!JSON.stringify(error).includes(token));
+  const metadata=(await stack.sql("SELECT k,v FROM state WHERE k LIKE 'agent:session:%'")).map(row=>({key:row.k,...JSON.parse(row.v)})).find(meta=>meta.owner===owner);
+  assert.equal(metadata.launch_error.confirmed_refusal,true);
+  return {token,metadata,error};
+}
+async function ageLaunchReservation(id){
+  const rows=await stack.sql("SELECT k,v FROM state WHERE k LIKE 'agent:rate:%'");
+  const row=rows.find(row=>JSON.parse(row.v).launches.some(launch=>launch.id===id));assert(row);
+  const value=JSON.parse(row.v);for(const launch of value.launches)launch.at=new Date(Date.now()-5*60000).toISOString();
+  await stack.sql("UPDATE state SET v='"+JSON.stringify(value).replaceAll("'","''")+"' WHERE k='"+row.k+"'");
+}
+test('confirmed refusals use a short retry delay without consuming the daily GPU launch allowance',async()=>{
+  const owner='refusedcounter',first=await failedLaunchFixture(owner),before=pushes.length;
+  const quick=await bootstrap(first.token,randomUUID());assert.equal(quick.status,429);
+  const blocked=(await quick.json()).error;assert.equal(blocked.code,'personal_retry_cooldown');assert.equal(blocked.origin,'connector');assert(blocked.retry_after_seconds<=30);assert.equal(pushes.length,before);
+  let id=first.metadata.id;
+  for(let attempt=0;attempt<8;attempt++){
+    await ageLaunchReservation(id);
+    const response=await bootstrap(first.token,randomUUID());assert.equal(response.status,502);assert.equal((await response.json()).error.code,'kaggle_refused');
+    const row=(await stack.sql("SELECT v FROM state WHERE k LIKE 'agent:session:%' AND json_extract(v,'$.owner')='"+owner+"' ORDER BY updated_at DESC LIMIT 1"))[0];id=JSON.parse(row.v).id;
+  }
+  assert.equal(pushes.length,before+8,'Nine refused submissions must not hit an eight accepted-launch limit');
+});
+
+test('SaveKernel HTTP503 stays unknown and same-reference reconciliation never submits a second notebook',async()=>{
+  const owner='ambiguoussave',token='KGAT_'+owner+'_01234567890123456789',clientId=randomUUID();accounts.set(token,owner);saveRefusals.set(owner,{status:503});
+  const before=pushes.length,first=await bootstrap(token,clientId);assert.equal(first.status,202);
+  const session=await first.json();assert.equal(session.launch_state,'unknown');
+  const metadata=JSON.parse((await stack.sql("SELECT v FROM state WHERE k='agent:session:"+session.session_id+"'"))[0].v);
+  assert.equal(metadata.launch_error.upstream_status,503);assert.equal(metadata.launch_error.confirmed_refusal,false);
+  const retry=await bootstrap(token,clientId);assert.equal(retry.status,200);assert.equal((await retry.json()).session_id,session.session_id);assert.equal(pushes.length,before+1);
+  const other=await bootstrap(token,randomUUID());assert.equal(other.status,409);assert.equal((await other.json()).error.code,'personal_session_active');assert.equal(pushes.length,before+1);
+});
+
+for(const state of ['RUNNING',404,503,''])test(`legacy failed reservations reconcile Kaggle ${state||'empty status'} before any new launch`,async()=>{
+  const owner='legacy'+(String(state).toLowerCase()||'empty'),{token,metadata}=await failedLaunchFixture(owner);
+  delete metadata.key;delete metadata.launch_error;
+  await stack.sql("UPDATE state SET v='"+JSON.stringify(metadata).replaceAll("'","''")+"' WHERE k='agent:session:"+metadata.id+"'");
+  await ageLaunchReservation(metadata.id);statuses.set(metadata.slug,typeof state==='number'?{http:state}:state);saveRefusals.delete(owner);
+  const before=pushes.length,response=await bootstrap(token,randomUUID());
+  if(state===404){assert.equal(response.status,201);assert.equal(pushes.length,before+1);}
+  else{assert.equal(response.status,409);assert.equal((await response.json()).error.code,state==='RUNNING'?'personal_session_active':'personal_launch_unconfirmed');assert.equal(pushes.length,before);}
+});
+
+test('a string provider error is classified without leaking its token or private URL',async()=>{
+  const token='KGAT_fixture_redaction_canary_0123456789';
+  const result=await failedLaunchFixture('stringfailure',{refusalBody:{error:'GPU quota exhausted '+token+' https://private.trycloudflare.com/account'}});
+  assert.equal(result.error.category,'gpu_quota');assert.equal(result.error.upstream_status,400);
+  assert(!JSON.stringify(result).includes('private.trycloudflare.com'));
+  assert(!JSON.stringify(result.metadata).includes(token));assert(!JSON.stringify(result.error).includes(token));
 });

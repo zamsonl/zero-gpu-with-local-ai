@@ -135,7 +135,9 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(Path(call.args[0][0]).is_file())
         self.runtime["http"].assert_called_once_with("POST", "http://127.0.0.1:11434/api/show", {"model": self.runtime["MODEL"]}, timeout=120)
         self.runtime["serve"].assert_called_once_with(81920, True, "Q5_K_P", "https://example.trycloudflare.com")
-        self.runtime["install_async_job_routes"].assert_called_once_with(self.runtime["start_stream_proxy"].return_value)
+
+        self.runtime["install_async_job_routes"].assert_called_once_with(self.runtime["start_stream_proxy"].return_value, max_job_seconds=7200, max_stream_seconds=300)
+        self.assertIs(self.runtime["OWNER_JOBS"], self.runtime["install_async_job_routes"].return_value)
         self.runtime["start_stream_proxy"].return_value.shutdown.assert_called_once()
         self.runtime["start_stream_proxy"].return_value.server_close.assert_called_once()
         self.assertEqual(self.runtime["PICTURES"].cache, self.cache)
@@ -163,6 +165,8 @@ class RuntimeTests(unittest.TestCase):
         self.runtime["sees_pictures"].assert_called_once_with(81920)
         self.runtime["http"].assert_not_called()
         self.runtime["serve"].assert_called_once_with(81920, True, "Q5_K_P", "https://example.trycloudflare.com")
+        self.runtime["install_async_job_routes"].assert_called_once_with(self.runtime["start_stream_proxy"].return_value, max_job_seconds=7200, max_stream_seconds=300)
+        self.assertIs(self.runtime["OWNER_JOBS"], self.runtime["install_async_job_routes"].return_value)
 
     def test_unreadable_cached_model_unlinks_owned_links_before_downloading(self):
         self.require_symlinks()
@@ -290,6 +294,35 @@ class LoadStartupTests(unittest.TestCase):
         command = next(call.args[1] for call in relay.call_args_list if call.args[0] == "GET")
         self.assertIn("&active_generation=" + owner, command)
         jobs.cancel_generations.assert_called_once_with([owner])
+
+    def test_owner_active_job_prevents_idle_shutdown_during_two_hours_of_quiet_prefill(self):
+        from types import SimpleNamespace
+        runtime = self.runtime
+        now = [1000]
+        ticks = [0]
+
+        def tick(_seconds):
+            if ticks[0] == 2:
+                raise KeyboardInterrupt
+            ticks[0] += 1
+            now[0] += 3600
+
+        jobs = Mock()
+        jobs.busy.return_value = True
+        relay = Mock(side_effect=lambda method, path, *args: {"registered": True, "idle_minutes": 45} if method == "GET" else {})
+        runtime.update({"AGENT_ONLY": False, "OWNER_JOBS": jobs, "relay": relay,
+                        "STARTED": 1000, "MAX_RUNTIME_S": 3 * 3600, "requests_served": lambda: 0,
+                        "gpu_busy": lambda: False, "PICTURES": Mock(), "reachable": lambda _url: True,
+                        "time": SimpleNamespace(time=lambda: now[0], sleep=tick)})
+        with self.assertRaises(KeyboardInterrupt):
+            runtime["serve"](98304, True, "Q5_K_P", "https://example.trycloudflare.com")
+        self.assertEqual(jobs.busy.call_count, 2)
+        registration = relay.call_args_list[0].args[2]
+        self.assertEqual(registration["job_max_leg_seconds"], 300)
+        self.assertNotIn("job_control", registration)
+        commands = [call.args[1] for call in relay.call_args_list if call.args[0] == "GET"]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all("&idle=0" in command for command in commands))
 
     def test_local_load_error_keeps_bounded_reason_without_secrets_or_body_dump(self):
         runtime = self.runtime

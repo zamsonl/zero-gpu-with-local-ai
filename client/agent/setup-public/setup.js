@@ -64,10 +64,10 @@ function render(next){
   $('cancel').textContent=running?'Stop notebook':phase==='stopping'?'Stopping…':'Cancel setup';
   $('cancel').disabled=phase==='stopping';
   $('close-help').textContent=running?'You can close this setup window. Exit OpenCode to stop your notebook.':'Closing setup during startup requests cancellation after a short reconnect grace period.';
-  $('start').textContent=running?'OpenCode is running':isBusy?'Starting Qwen…':phase==='error'&&state.canRetry?'Try again':'Start Qwen';
+  $('start').textContent=running?'OpenCode is running':isBusy?'Starting Qwen…':state.retrySameLaunch?'Check same launch':phase==='error'&&state.canRetry?'Try again':'Start Qwen';
   if(!isBusy&&!running){const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 20 20');svg.setAttribute('aria-hidden','true');const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d','M4 10h12m-5-5 5 5-5 5');svg.append(path);$('start').append(svg);}
   $('start').disabled=isBusy||running||(phase==='error'&&state.canRetry===false);
-  $('start-help').textContent=phase==='error'&&state.canRetry===false?'Check your Kaggle notebook before starting another session.':running?'OpenCode owns this notebook now.':'OpenCode opens when your model is ready.';
+  $('start-help').textContent=state.retrySameLaunch?'Rechecks the saved launch reference without submitting another notebook.':phase==='error'&&state.canRetry===false?'Check your Kaggle notebook before starting another session.':running?'OpenCode owns this notebook now.':'OpenCode opens when your model is ready.';
   if(!initialized){if(state.folder){$('folder').value=state.folder;folderEdited=true;}if(typeof state.browser==='boolean')$('browser').checked=state.browser;if(state.modelUrl)$('model-url').value=state.modelUrl;initialized=true;}
   if(state.folder&&!folderEdited&&document.activeElement!==$('folder'))$('folder').value=state.folder;
   const saved=!!state.rememberedToken;

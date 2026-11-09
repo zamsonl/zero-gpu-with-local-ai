@@ -27,6 +27,10 @@ Thinking is visible by default. Working notes are carried into subsequent model 
 
 A recognized runner/tool-format failure gets at most one bounded recovery with thinking off. Failed actions are not released or replayed. Unknown streams, Stop, memory exhaustion and tokenizer overflow have separate handling. A model request has a two-hour limit; recovery cannot loop indefinitely.
 
+Two hours is a wall-time allowance per generation, not an unlimited token window. Automatic compaction keeps the session usable as it grows, subject to the selected model's context and finite summaries. The connector stops repeated identical tool/result cycles across turns even when OpenCode's own loop check misses them. Hosting shutdowns and exhausted budgets can still interrupt work. After updating, restart the notebook and reopen this helper; an already running process keeps its previous settings.
+
+Setup saves a non-secret launch reference before contacting Kaggle. If confirmation is lost, Retry checks that same notebook instead of submitting another. Confirmed refusals use a short retry delay rather than consuming the connector's daily GPU-launch allowance. Kaggle's own quota and permission limits still apply. The event log identifies the source, operation, HTTP status and available wait time; deleting notebooks or the private cache is not a normal restart step.
+
 ## Privacy, approvals and shutdown
 
 The Kaggle token is used over HTTPS for your own cache/session operations. It is never included in model messages, OpenCode configuration, notebook source or child-process environment. The relay handles model traffic: use a deployment you trust. OpenCode history stays in its isolated local project/account storage. The website has separate cloud-backed chat storage.

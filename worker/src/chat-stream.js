@@ -17,6 +17,7 @@ const DROPPED = "The connection to the model server dropped mid-reply.";
 export function streamTiming(scale = 1) {
   return {
     firstTokenMs: 6 * 60_000 * scale, // give up when no token has arrived after this long
+    jobMs: 2 * 60 * 60_000 * scale, // one accepted resumable job, including prefill; never reset by a leg
     retryStepMs: 5_000 * scale, // retry waits grow 5 s, 10 s, 15 s, …
     retryMaxMs: 30_000 * scale, // … capped here
     statusEveryMs: 10_000 * scale, // before the first token, clients hear from us at least this often
@@ -67,26 +68,36 @@ export async function* streamChat({ target, reloadTarget, body, signal, timing, 
   }
 }
 
-/** Resumable tunnel legs, with the same first-token and Stop semantics as direct streams. */
-async function* jobStream({ target, payload, signal, deadline, status, path, transform, requestBudget, reloadTarget }) {
+/** A healthy accepted job may prefill for its full lifetime; missing servers still fail bounded recovery. */
+async function* jobStream({ target, payload, signal, timing, status, path, transform, requestBudget, reloadTarget }) {
   const controller = new AbortController();
   const forwardAbort = () => controller.abort(signal.reason);
   signal.addEventListener("abort", forwardAbort, { once: true });
   if (signal.aborted) controller.abort(signal.reason);
-  const timer = setTimeout(() => controller.abort(new DeadlineReached()), Math.max(0, deadline - Date.now()));
-  let started = false;
+  let started = false, accepted = false;
   status.set("connecting", "Waiting for Qwen to start responding", 1);
   try {
     // jobs-v1 itself proves the server is present; omit the parallel /api/ps
     // probe so multi-chunk compaction shares a predictable external-call budget.
-    for await (const part of streamJobRecords({ target, path, payload, signal: controller.signal, requestBudget, reloadTarget })) {
+    for await (const part of streamJobRecords({
+      target, path, payload, signal: controller.signal, requestBudget, reloadTarget,
+      // 24 five-minute reads cover two hours using 26 external calls including
+      // start and cleanup. Short silent-prefill legs would exhaust that budget.
+      legSeconds: 300, prefillLegSeconds: 300, maxJobMs: timing.jobMs ?? streamTiming().jobMs,
+      onHeartbeat: () => {
+        if (!started && !accepted) {
+          accepted = true;
+          status.set("waiting", "Model job accepted; waiting for the first Qwen output", 1);
+        }
+      },
+    })) {
       const raw = part.value;
       if (raw.error) throw new UpstreamError(`The model server reported an error: ${raw.error}`);
       if (part.upstreamStatus !== null && part.upstreamStatus >= 300) throw new UpstreamError(`The model server answered HTTP ${part.upstreamStatus}.`);
       const chunk = transform ? transform(raw) : raw;
       if (!started) {
         if (!isFirstToken(chunk)) continue;
-        started = true; clearTimeout(timer); status.stop();
+        started = true; status.stop();
       }
       yield chunk;
       if (chunk.done) return;
@@ -94,11 +105,14 @@ async function* jobStream({ target, payload, signal, deadline, status, path, tra
     throw new UpstreamError(DROPPED, { code: 'upstream_eof' });
   } catch (error) {
     if (signal.aborted) throw signal.reason;
-    if (controller.signal.reason instanceof DeadlineReached) throw giveUp();
-    if (error instanceof JobsTransportError) throw new UpstreamError(error.message, { code: error.code, cause: error });
+    if (error instanceof JobsTransportError) {
+      const message = error.code === "invalid_poll"
+        ? "The running notebook does not support five-minute connections. Restart Kaggle or Colab with the updated notebook to enable two-hour model jobs."
+        : error.message;
+      throw new UpstreamError(message, { code: error.code, cause: error });
+    }
     throw error;
   } finally {
-    clearTimeout(timer);
     signal.removeEventListener("abort", forwardAbort);
     controller.abort();
   }

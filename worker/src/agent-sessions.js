@@ -59,11 +59,48 @@ export class AgentStateDB {
 async function kaggleCall(env,token,service,method,body,fetcher){
   let response;
   try{response=await fetcher((env.KAGGLE_API_BASE||'https://api.kaggle.com')+'/v1/'+service+'/'+method,{method:'POST',redirect:'manual',headers:{'content-type':'application/json',authorization:'Bearer '+token,'user-agent':'heretic-qwen-personal-agent/1'},body:JSON.stringify(body),signal:AbortSignal.timeout(30000)});}
-  catch{throw new HttpError(502,'kaggle_unknown','Kaggle did not confirm this request. Check your own Kaggle notebook before starting another.');}
-  if(!response.ok){await response.body?.cancel();throw new HttpError(response.status===401||response.status===403?401:502,'kaggle_refused','Kaggle refused the supplied token or notebook request. Check your own account token, GPU access and quota.');}
+  catch{throw new HttpError(502,'kaggle_unknown','Kaggle did not confirm this request. Retry the same launch reference to check it; no second notebook will be submitted.',{origin:'kaggle',operation:method,launch_uncertain:true});}
+  if(!response.ok){
+    // Never reflect a provider body: it may include a credential, notebook code,
+    // or a private URL. Retain only bounded structural diagnostics/classification.
+    let result=null;try{result=await readJsonObject(response,8192);}catch{}
+    const rawCode=result?.error?.code??result?.code;
+    const upstream_code=Number.isSafeInteger(rawCode)?rawCode:typeof rawCode==='string'&&/^[A-Za-z0-9_.:-]{1,40}$/.test(rawCode)&&!rawCode.startsWith('KGAT_')?rawCode:undefined;
+    const explanation=String(result?.error?.message??(typeof result?.error==='string'?result.error:null)??result?.message??'');
+    const category=/gpu.*(?:quota|hours|limit)|(?:quota|hours).*gpu/i.test(explanation)?'gpu_quota'
+      :/dataset/i.test(explanation)?'dataset_access':/verif(?:y|ication)|phone/i.test(explanation)?'account_verification'
+      :/concurrent|already.*running|too many.*(?:kernel|notebook)/i.test(explanation)?'concurrent_notebooks'
+      :/permission|forbidden|unauthori[sz]ed/i.test(explanation)?'account_permission':'request_rejected';
+    const confirmed_refusal=response.status>=400&&response.status<500&&response.status!==408;
+    const code=confirmed_refusal?(response.status===429?'kaggle_rate_limit':'kaggle_refused'):'kaggle_unknown';
+    throw new HttpError(response.status===401||response.status===403&&method==='IntrospectToken'?401:response.status===429?429:502,code,
+      `Kaggle ${confirmed_refusal?'refused':'did not confirm'} ${method} (HTTP ${response.status}; ${category}). ${confirmed_refusal?'No accepted launch was confirmed.':'Check the same launch reference before starting another notebook.'}`,
+      {origin:'kaggle',operation:method,upstream_status:response.status,...(upstream_code===undefined?{}:{upstream_code}),category,confirmed_refusal,launch_uncertain:!confirmed_refusal});
+  }
   const result=await response.json().catch(()=>null);
-  if(!result||result.error)throw new HttpError(502,'kaggle_unknown','Kaggle returned an unconfirmed result. Check your own Kaggle account before starting another.');
+  if(!result||result.error)throw new HttpError(502,'kaggle_unknown','Kaggle returned an unconfirmed result. Retry the same launch reference to check it.',{origin:'kaggle',operation:method,launch_uncertain:true});
   return result;
+}
+
+const terminalKaggleStatus=status=>['COMPLETE','ERROR','CANCELED','CANCELLED','CANCEL_ACKNOWLEDGED'].includes(String(status||'').toUpperCase());
+const rejectedLaunch=meta=>meta?.launch_state==='failed'&&(meta.launch_error?.confirmed_refusal===true||meta.launch_error?.submission_sent===false);
+async function reconcileLaunch(db,meta,env,token,fetcher){
+  if(rejectedLaunch(meta)||meta.ended_at)return meta;
+  try{
+    const result=await kaggleCall(env,token,'kernels.KernelsApiService','GetKernelSessionStatus',{userName:meta.owner,kernelSlug:meta.slug},fetcher);
+    if(typeof result.status!=='string'||!result.status.trim())throw new HttpError(502,'kaggle_unknown','Kaggle did not return a notebook status.');
+    const updated={...meta,launch_state:'launched',reconciled_at:now(),kaggle_status:String(result.status).toUpperCase(),...(terminalKaggleStatus(result.status)?{ended_at:now()}:{} )};
+    await write(db,metaKey(meta.id),updated);return updated;
+  }catch(error){
+    // Old releases marked every HTTP error as failed, including ambiguous5xx.
+    // Only a failed legacy record now confirmed absent can leave the launch quota.
+    // Unknown/creating records retain their reservation even on an early404.
+    if(meta.launch_state==='failed'&&error?.extra?.upstream_status===404){
+      const updated={...meta,reconciled_at:now(),launch_error:{code:'kaggle_not_found',origin:'kaggle',operation:'GetKernelSessionStatus',upstream_status:404,confirmed_refusal:true}};
+      await write(db,metaKey(meta.id),updated);return updated;
+    }
+    throw new HttpError(409,'personal_launch_unconfirmed','The previous notebook state could not be verified. Retry the same launch reference; another GPU notebook was not submitted.',{origin:error?.extra?.origin==='kaggle'?'kaggle':'connector',operation:'GetKernelSessionStatus',launch_uncertain:true,...(error?.extra?.upstream_status?{upstream_status:error.extra.upstream_status}:{} )});
+  }
 }
 
 async function reserveLaunch(db,owner,id,env,token,fetcher){
@@ -72,17 +109,21 @@ async function reserveLaunch(db,owner,id,env,token,fetcher){
     const row=await db.prepare('SELECT v FROM state WHERE k = ?1').bind(key).first();
     const previous=row?JSON.parse(row.v):{launches:[]};
     const cutoff=Date.now()-24*3600000;
-    const recent=previous.launches.filter(x=>Date.parse(x.at)>cutoff);
+    const recent=previous.launches.filter(x=>Date.parse(x.at)>cutoff),counted=[],rejected=[];
     if(recent.some(x=>x.id===id))return;
     for(const item of recent){
-      const active=await read(db,metaKey(item.id));
-      if(!active||active.ended_at||active.launch_state==='failed'||Date.parse(active.expires_at)<=Date.now())continue;
-      const run=await kaggleCall(env,token,'kernels.KernelsApiService','GetKernelSessionStatus',{userName:owner,kernelSlug:active.slug},fetcher);
-      if(['COMPLETE','ERROR','CANCELED','CANCELLED','CANCEL_ACKNOWLEDGED'].includes(String(run.status||'').toUpperCase()))await write(db,metaKey(item.id),{...active,ended_at:now()});
-      else throw new HttpError(409,'personal_session_active','This Kaggle account already has a personal coding notebook running or queued. Resume the same helper session, or stop that notebook in Kaggle before creating another.');
+      let active=await read(db,metaKey(item.id));
+      if(active&&!active.ended_at&&Date.parse(active.expires_at)>Date.now())active=await reconcileLaunch(db,active,env,token,fetcher);
+      if(rejectedLaunch(active)){rejected.push(item);continue;}
+      counted.push(item);
+      if(!active||active.ended_at||Date.parse(active.expires_at)<=Date.now())continue;
+      throw new HttpError(409,'personal_session_active','This Kaggle account already has a personal coding notebook running or queued. Resume the same helper session, or stop that notebook in Kaggle before creating another.',{origin:'connector',launch_uncertain:false});
     }
-    if(recent.length>=8||recent.some(x=>Date.now()-Date.parse(x.at)<4*60000))throw new HttpError(429,'personal_launch_limit','This Kaggle account was asked to start a session recently. Reuse the existing helper session or check Kaggle before starting another.');
-    const next=JSON.stringify({launches:[...recent,{id,at:now()}]});
+    const rejectedDelay=Math.max(0,...rejected.map(x=>30_000-(Date.now()-Date.parse(x.at))));
+    if(rejectedDelay>0)throw new HttpError(429,'personal_retry_cooldown','The last refused launch has a short connector retry delay. Its refusal did not consume the daily GPU-launch allowance.',{origin:'connector',limit_kind:'rejected_retry',retry_after_seconds:Math.ceil(rejectedDelay/1000),launch_uncertain:false});
+    const delay=Math.max(0,...counted.map(x=>4*60000-(Date.now()-Date.parse(x.at))));
+    if(counted.length>=8||delay>0)throw new HttpError(429,'personal_launch_limit','The connector safety limit was reached. Reuse the existing launch reference; replacing the Kaggle token does not change this account limit.',{origin:'connector',limit_kind:counted.length>=8?'daily':'cooldown',retry_after_seconds:Math.ceil((counted.length>=8?Math.min(...counted.map(x=>Date.parse(x.at)+24*3600000-Date.now())):delay)/1000),launch_uncertain:false});
+    const next=JSON.stringify({launches:[...counted,...rejected.filter(x=>Date.now()-Date.parse(x.at)<30_000),{id,at:now()}]});
     const changed=row?await db.prepare('UPDATE state SET v = ?1, updated_at = ?2 WHERE k = ?3 AND v = ?4').bind(next,now(),key,row.v).run():await db.prepare('INSERT OR IGNORE INTO state (k, v, updated_at) VALUES (?1, ?2, ?3)').bind(key,next,now()).run();
     if(changed.meta.changes){
       // Only this authenticated owner's expired session namespaces are eligible for cleanup.
@@ -116,11 +157,14 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
     const id=(await derived(env.RELAY_KEY,'agent-session:'+owner.toLowerCase()+':'+clientId)).slice(0,40);
     const key=await derived(env.RELAY_KEY,'agent-helper:'+id);
     const launchToken=await derived(env.RELAY_KEY,'agent-notebook:'+id);
-    const existing=await read(env.DB,metaKey(id));
+    let existing=await read(env.DB,metaKey(id));
     if(existing){
       if((existing.model?.url||null)!==(requestedModel?.url||null))throw new HttpError(409,"personal_model_changed","This launch identity belongs to another model. Stop its notebook before starting a different model.");
-      if(existing.owner!==owner||Date.parse(existing.expires_at)<=Date.now()||existing.launch_state==='failed')throw new HttpError(409,'personal_session_expired','This launch identity is expired or failed. Check Kaggle, then start a new helper launch.');
+      if(existing.owner!==owner||Date.parse(existing.expires_at)<=Date.now())throw new HttpError(409,'personal_session_expired','This launch identity has expired. Start a new helper launch after checking your notebook.',{origin:'connector',launch_uncertain:false});
       if(!(await equalHash(key,existing.helper_hash)))throw new HttpError(409,'personal_session_changed','The relay signing key changed. Check the old notebook before launching again.');
+      if(['failed','unknown','creating'].includes(existing.launch_state))existing=await reconcileLaunch(env.DB,existing,env,body.kaggle_token,fetcher);
+      if(rejectedLaunch(existing))throw new HttpError(502,'personal_launch_refused','The previous notebook submission was refused or confirmed absent. Retry creates a new launch reference after the short retry delay.',{...existing.launch_error,origin:existing.launch_error?.origin||'connector',launch_uncertain:false});
+      if(existing.ended_at)throw new HttpError(409,'personal_session_ended','The notebook for this launch reference has finished. Start a new helper launch.',{origin:'connector',launch_uncertain:false});
       return json(descriptor(new URL(request.url).origin,existing,key),existing.launch_state==='creating'?202:200);
     }
     const personalCache=body.cache_id?await readyPersonalCache({env,owner,cacheId:body.cache_id,modelUrl:requestedModel?.url||null}):null;
@@ -137,8 +181,8 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
       await write(env.DB,prefix(id)+'boot',{host:'kaggle',stage:'queued',detail:'Notebook submitted to Kaggle. Waiting for the first startup report; GPU queue state is not yet confirmed.',at:now()});
       payload={slug:`${owner}/${slug}`,newTitle:'Qwen Local Coding Agent',text:serverScript({relay:base,token:launchToken,quant:model?.quant||'Q5_K_P',contexts:model?[32768,24576,16384,8192]:[98304],vision:false,cacheId:personalCache?.cache_id||(cacheDataset?env.KAGGLE_CACHE_ID||'':''),numBatch:model?128:256,profileId:model?.profile_id||'personal-agent-q5-kv8-b256-96k',agentOnly:true,modelSpec:model,personalCacheSpec:personalCache?.spec||null}),language:'python',kernelType:'script',isPrivate:true,enableGpu:true,enableInternet:true,machineShape:'NvidiaTeslaT4',kernelExecutionType:'SAVE_AND_RUN_ALL',datasetDataSources:cacheDataset?[cacheDataset]:[],kernelDataSources:[],competitionDataSources:[],modelDataSources:[],categoryIds:[]};
     }catch{
-      metadata.launch_state='failed';await write(env.DB,metaKey(id),metadata).catch(()=>{});
-      throw new HttpError(503,'personal_prepare_failed','The personal notebook could not be prepared. No Kaggle start request was sent.');
+      metadata.launch_state='failed';metadata.launch_error={origin:'connector',operation:'PrepareKernel',submission_sent:false};await write(env.DB,metaKey(id),metadata).catch(()=>{});
+      throw new HttpError(503,'personal_prepare_failed','The personal notebook could not be prepared. No Kaggle start request was sent.',{...metadata.launch_error,launch_uncertain:false});
     }
     try{
       const saved=await kaggleCall(env,body.kaggle_token,'kernels.KernelsApiService','SaveKernel',payload,fetcher);
@@ -149,9 +193,10 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
       // A lost SaveKernel acknowledgement must never automatically create a second GPU run.
       // SaveKernel may have succeeded even when its response or the later D1 acknowledgement
       // was lost. Only an explicit Kaggle HTTP refusal proves that no confirmed launch exists.
-      metadata.launch_state=error instanceof HttpError&&error.code==='kaggle_refused'?'failed':'unknown';
+      metadata.launch_state=error instanceof HttpError&&error.extra?.confirmed_refusal===true?'failed':'unknown';
+      metadata.launch_error={code:error.code||'kaggle_unknown',...(error.extra||{}),at:now()};
       await write(env.DB,metaKey(id),metadata).catch(()=>{});
-      await write(env.DB,prefix(id)+'boot',{host:'kaggle',stage:metadata.launch_state==='failed'?'failed':'queued',detail:metadata.launch_state==='failed'?'Kaggle refused this personal notebook request.':'Launch confirmation was lost. Check your personal Kaggle notebook before launching another.',at:now()}).catch(()=>{});
+      await write(env.DB,prefix(id)+'boot',{host:'kaggle',stage:metadata.launch_state==='failed'?'failed':'queued',detail:metadata.launch_state==='failed'?error.message:`Kaggle SaveKernel did not confirm the submission${metadata.launch_error.upstream_status?' (HTTP '+metadata.launch_error.upstream_status+')':''}. Retry the same launch reference to check this notebook; another notebook will not be submitted.`,at:now()}).catch(()=>{});
       if(metadata.launch_state==='unknown')return json(descriptor(new URL(request.url).origin,metadata,key),202);
       throw error;
     }
