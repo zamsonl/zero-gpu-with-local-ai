@@ -1,5 +1,11 @@
 # Troubleshooting
 
+## Quick Start
+
+Use [the three-step guide](QUICKSTART.md). If Offline appears, run the notebook and paste its newest whole link. If the key is rejected, use the newest notebook output; the connection key is not a Kaggle API token. Downloading model files again and the absence of compaction/coding tools are expected in Quick Start. Use [Advanced Setup](SETUP.md) for those features.
+
+## Advanced Setup
+
 | Symptom | Action |
 | --- | --- |
 | Setup package is not linked to a deployment | Download a configured ZIP from your own server; administrators run `npm run configure -- https://YOUR-WORKER.workers.dev` and redeploy. |

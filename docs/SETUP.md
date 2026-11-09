@@ -1,6 +1,10 @@
-# Deploy your own workspace
+# Advanced Setup — full workspace and local coding agent
 
-Requirements: Node.js 20+ with npm, Python 3.10+ for packaging/tests, a Cloudflare account with Workers/D1/R2 access, and your own eligible Kaggle or Colab account. Follow provider rules and current plan limits.
+For simple browser chat, use [Quick Start](QUICKSTART.md). It needs no website deployment. This optional advanced setup adds compaction, model/runtime caching, the full image-generation workflow and OpenCode integration. Download **DOWNLOAD ME.zip**, extract it, then follow the steps below.
+
+**You will need:** a Cloudflare account, your own eligible Kaggle account, and a computer where you can run the commands below. Model inference still runs on the cloud GPU. Follow one section at a time; keep credentials private.
+
+Requirements: Node.js 20+ with npm, Python 3.11+ for packaging/tests, a Cloudflare account with Workers/D1/R2 access, and your own eligible Kaggle or Colab account. Follow provider rules and current plan limits.
 
 ## 1. Create Cloudflare resources
 
@@ -41,11 +45,15 @@ The configure command writes ignored `client/agent/deployment.local.json`, rebui
 
 For local development, copy `worker/.dev.vars.example` to `worker/.dev.vars` and use only your own development secrets. That file is ignored and should never be committed. Follow the same resource configuration with local migrations when running Wrangler locally.
 
+## Open your advanced workspace
+
+Open `https://YOUR-WORKER.workers.dev/connect.html` on your own deployment. Enter the **RELAY_KEY** you created in section 1. The page checks the key, saves it in this browser and opens your workspace. This is different from the Kaggle API token; do not paste a Kaggle token into that field.
+
 ## 3. Run a website model notebook
 
-Kaggle: use the website Start control with your optional owner API secret, or import `notebooks/kaggle.ipynb`, provide your deployment origin/relay key, select the required GPU configuration and Internet access, and run it privately. Background committed runs differ from interactive sessions; confirm GPU shutdown in Kaggle when finished.
+Kaggle: use the website Start control with your optional owner API secret, or import `notebooks/advanced/kaggle.ipynb`, provide your deployment origin/relay key, select the required GPU configuration and Internet access, and run it privately. Background committed runs differ from interactive sessions; confirm GPU shutdown in Kaggle when finished.
 
-Colab: download the current configured Colab notebook from your deployment, or upload `notebooks/colab.ipynb`. Set your relay origin in `COLAB_CONFIG`, provide `QWEN_RELAY_KEY` through Colab Secrets or the hidden prompt, choose an available GPU and keep the runtime connected. Free Colab has usage restrictions; consult its FAQ. A new Colab VM does not mount Kaggle Datasets and may download files again.
+Colab: download the current configured Colab notebook from your deployment, or upload `notebooks/advanced/colab.ipynb`. Set your relay origin in `COLAB_CONFIG`, provide `QWEN_RELAY_KEY` through Colab Secrets or the hidden prompt, choose an available GPU and keep the runtime connected. Free Colab has usage restrictions; consult its FAQ. A new Colab VM does not mount Kaggle Datasets and may download files again.
 
 `COLAB_URL` may point to **your own** private notebook for the website's Open Colab shortcut. The default template opens Colab's homepage and contains no personal Drive link.
 
@@ -56,3 +64,7 @@ Open `/agent/` on your deployed website and download the configured ZIP. Extract
 The first setup prepares your private cache using a CPU notebook. The GPU session starts after the Dataset is ready. Later starts reuse that Dataset. Private/gated or unsupported model sources are rejected; optional links support public Hugging Face complete GGUF files only. Your notebook and Dataset links appear in setup activity.
 
 Read the bundled `README.md` and `OPENCODE.md` for approvals, history, browser isolation, continuing sessions, token replacement and shutdown.
+
+## If you are unsure which download to use
+
+Start with [Quick Start](QUICKSTART.md) to try browser chat. Return here when you want compaction, caching or the local coding agent. Quick Start notebooks connect directly to the supplied chat app; the `notebooks/advanced/` files instead connect to the Worker you configure above. They are different paths, so use the notebook from the guide you are following.
