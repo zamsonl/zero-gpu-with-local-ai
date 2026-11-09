@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="398" viewBox="0 0 1200 398" role="img" aria-labelledby="title description">
+<title id="title">One model, two ways to work</title><desc id="description">Browser chat and local OpenCode tools connect through your Cloudflare Worker to your Kaggle or Colab model notebook. Website history is in D1 and R2; local coding history is on your computer. Local-agent model files are reused from your private Kaggle Dataset.</desc>
+<defs><marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto-start-reverse"><path d="m1 1 5 2.5L1 6" fill="none" stroke="#777" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect width="1200" height="398" rx="30" fill="#f5f5f5"/>
+<g font-family="Arial,Helvetica,sans-serif" fill="#111">
+<text x="36" y="51" font-size="27" font-weight="700" letter-spacing="-.7">One model. Two ways to work.</text>
+<g transform="translate(36 89)"><rect width="326" height="174" rx="23" fill="#fff" stroke="#dedede"/><text x="25" y="39" font-size="22" font-weight="700">Your computer</text><text x="25" y="76" font-size="18">Chat in your browser</text><text x="25" y="106" font-size="18">Code with OpenCode</text><text x="25" y="145" font-size="15" fill="#666">Project files · terminal · browser tools</text></g>
+<g transform="translate(438 89)"><rect width="322" height="174" rx="23" fill="#fff" stroke="#dedede"/><text x="25" y="39" font-size="22" font-weight="700">Your relay</text><text x="25" y="76" font-size="18">Cloudflare Worker</text><text x="25" y="106" font-size="18">Connects UI and model</text><text x="25" y="145" font-size="15" fill="#666">D1 + R2 store website history and files</text></g>
+<g transform="translate(836 89)"><rect width="328" height="174" rx="23" fill="#111"/><text x="25" y="39" font-size="22" font-weight="700" fill="#fff">Your cloud GPU</text><text x="25" y="76" font-size="18" fill="#fff">Kaggle or Colab</text><text x="25" y="106" font-size="18" fill="#fff">Runs Qwen inference</text><text x="25" y="145" font-size="15" fill="#bdbdbd">Uses your account and allowance</text></g>
+<path d="M377 176h45m353 0h45" stroke="#777" stroke-width="2" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+<text x="38" y="311" font-size="18" font-weight="600">Local-agent startup: download once, reuse later.</text>
+<text x="38" y="343" font-size="16" fill="#606060">A CPU builder saves model + runtime files in your private Kaggle Dataset.</text>
+<text x="38" y="368" font-size="16" fill="#606060">GPU sessions reuse compatible cached files. Queueing and GPU loading still apply.</text>
+</g></svg>
