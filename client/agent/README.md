@@ -31,6 +31,8 @@ Two hours is a wall-time allowance per generation, not an unlimited token window
 
 Setup saves a non-secret launch reference before contacting Kaggle. If confirmation is lost, Retry checks that same notebook instead of submitting another. Confirmed refusals use a short retry delay rather than consuming the connector's daily GPU-launch allowance. Kaggle's own quota and permission limits still apply. The event log identifies the source, operation, HTTP status and available wait time; deleting notebooks or the private cache is not a normal restart step.
 
+After a successful authenticated cache check, setup remembers a manually entered token with Windows encryption even if GPU startup later fails. For an old deleted notebook that returns 403/404, the recovery checkbox requires a fresh confirmation that the old coding notebooks were deleted and are not running or queued. It checks your notebook inventory, GPU reservations and local activity before retiring eligible legacy tracking. It does not delete Kaggle notebooks or the cache, and cannot override a real permission or quota failure.
+
 ## Privacy, approvals and shutdown
 
 The Kaggle token is used over HTTPS for your own cache/session operations. It is never included in model messages, OpenCode configuration, notebook source or child-process environment. The relay handles model traffic: use a deployment you trust. OpenCode history stays in its isolated local project/account storage. The website has separate cloud-backed chat storage.

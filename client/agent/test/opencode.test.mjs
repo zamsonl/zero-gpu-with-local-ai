@@ -11,6 +11,8 @@ import {launchOpenCode,parseOpenCodeOptions,resolveOpenCode,installLocalTools,wa
 const TOKEN='KGAT_test_personal_token_123456789012345';
 const ID='personal_session_1234567890';
 const CLIENT_ID='launch_attempt_123456789012345';
+const CACHE_ID='fixture-private-cache';
+const readyCache=()=>({cache_id:CACHE_ID,owner:'testuser',dataset:'testuser/private-cache/2',model_url:null});
 const session=()=>({session_id:ID,relay:RELAY_ORIGIN+'/_agent/'+ID,key:'scoped_private_key_12345678901234567890',host:'kaggle',owner:'testuser',expires_at:new Date(Date.now()+12*3600000).toISOString(),url:'https://www.kaggle.com/code/testuser/qwen-agent-'+ID});
 const deferred=()=>{let resolve;const promise=new Promise(done=>resolve=done);return {promise,resolve};};
 
@@ -113,8 +115,8 @@ function fixture(){
     loadSavedToken:async()=>null,saveSavedToken:async()=>({protected:true}),forgetSavedToken:async()=>false,secureStorageAvailable:()=>true,
     checkManaged:async()=>{calls.push('managed');},resolveCLI:async()=>{calls.push('cli');return {command:'installed-opencode',args:[]};},
     promptToken:async()=>{calls.push('token');return TOKEN;},confirmUsage:async()=>{calls.push('consent');return true;},
-    prepareCache:async()=>null,
-    createSession:async value=>{calls.push('launch');assert.deepEqual(value,{token:TOKEN,consent:true,clientId:CLIENT_ID});return own;},
+    prepareCache:async()=>readyCache(),
+    createSession:async value=>{calls.push('launch');assert.deepEqual(value,{token:TOKEN,consent:true,clientId:CLIENT_ID,cacheId:CACHE_ID});return own;},
     startKeepAlive:(value,options)=>{calls.push('keepalive');assert.equal(value.relay,own.relay);assert.equal(typeof options.onError,'function');return {stop(){keepAliveStops++;},ready:Promise.resolve(true)};},
     waitForReady:async value=>{calls.push('ready');assert.equal(value.relay,own.relay);return true;},
     createRuntime:async value=>{calls.push('runtime');assert.equal(value.relay,own.relay);return {directory:'temporary-run',env:{[RELAY_KEY_ENV]:own.key},cleanup:async()=>{cleanup++;}};},
@@ -273,16 +275,74 @@ test('a remembered token skips Kaggle and hidden entry while keeping local brows
   }
 });
 
-test('new guided tokens are remembered only after successful account validation, and declined or rejected tokens are not saved',async()=>{
-  const f=guidedFixture([false]);let saves=0;f.deps.saveSavedToken=async value=>{assert.equal(value,TOKEN);assert(f.calls.includes('launch'));saves++;return {protected:true};};
+test('new guided tokens are remembered once after authenticated cache readiness and before GPU submission',async()=>{
+  const f=guidedFixture([false]);let saves=0,cacheReady=false;f.deps.prepareCache=async()=>{cacheReady=true;return readyCache();};f.deps.saveSavedToken=async value=>{assert.equal(value,TOKEN);assert(cacheReady);assert(!f.calls.includes('launch'));saves++;return {protected:true};};
   const running=await launchOpenCode([...launchArgs,'--setup'],f.deps);assert.equal(saves,1);await running.close();
-  for(const failure of ['consent','account','identity']){
-    const g=guidedFixture([false]);g.deps.saveSavedToken=async()=>{throw new Error('Rejected token must not be saved');};
+});
+
+test('declined consent and token or cache failures never save the manually entered token',async()=>{
+  for(const failure of ['consent','token','cache']){
+    const g=guidedFixture([false]);let saves=0;g.deps.saveSavedToken=async()=>{saves++;};
     if(failure==='consent')g.deps.confirmUsage=async()=>false;
-    if(failure==='account')g.deps.createSession=async()=>{throw new Error('Your Kaggle token was not accepted. No owner account fallback was used.');};
-    if(failure==='identity')g.deps.createSession=async()=>({...g.own,relay:RELAY_ORIGIN});
+    if(failure==='token')g.deps.prepareCache=async()=>{throw Object.assign(new Error('Kaggle did not accept the token.'),{status:401});};
+    if(failure==='cache')g.deps.prepareCache=async()=>{throw new Error('Private Dataset preparation failed.');};
     if(failure==='consent')assert.equal(await launchOpenCode([...launchArgs,'--setup'],g.deps),null);
     else await assert.rejects(launchOpenCode([...launchArgs,'--setup'],g.deps));
+    assert.equal(saves,0);assert(!g.calls.includes('launch'));
+  }
+});
+
+test('an authenticated manual token stays remembered when a later GPU status lookup fails',async()=>{
+  const f=guidedFixture([false]);let saved='',saves=0;
+  f.deps.saveSavedToken=async value=>{saved=value;saves++;};
+  f.deps.createSession=async()=>{assert.equal(saved,TOKEN);throw Object.assign(new Error('Kaggle did not confirm GetKernelSessionStatus (HTTP 403).'),{code:'personal_launch_unconfirmed',launchUncertain:true,operation:'GetKernelSessionStatus',upstreamStatus:403,retryAfter:30,providerBody:TOKEN});};
+  await assert.rejects(launchOpenCode([...launchArgs,'--setup'],f.deps),error=>{
+    assert.equal(error.launchUncertain,true);assert.equal(error.operation,'GetKernelSessionStatus');assert.equal(error.upstreamStatus,403);assert.equal(error.retryAfter,30);assert.equal(error.providerBody,undefined);assert(!JSON.stringify(error).includes(TOKEN));return true;
+  });
+  assert.equal(saves,1);assert.equal(saved,TOKEN);assert(!f.logs.join('\n').includes(TOKEN));assert(!f.calls.includes('spawn'));
+});
+
+test('cancellation at cache readiness saves no token and cancellation during secure save submits no GPU notebook',async()=>{
+  for(const when of ['cache','save']){
+    const f=guidedFixture([false]),cancellation=new AbortController();let saves=0;f.deps.signal=cancellation.signal;
+    f.deps.prepareCache=async()=>{if(when==='cache')cancellation.abort();return readyCache();};
+    f.deps.saveSavedToken=async()=>{saves++;cancellation.abort();};
+    assert.equal(await launchOpenCode([...launchArgs,'--setup'],f.deps),null);assert.equal(saves,when==='save'?1:0);assert(!f.calls.includes('launch'));
+  }
+});
+
+test('no-remember and ordinary manual launches do not save tokens even when the GPU launch fails',async()=>{
+  for(const args of [[...launchArgs,'--setup','--no-remember-token'],launchArgs]){
+    const f=guidedFixture([false]);let saves=0;f.deps.saveSavedToken=async()=>{saves++;};f.deps.createSession=async()=>{throw new Error('Notebook permission lookup failed.');};
+    await assert.rejects(launchOpenCode(args,f.deps),/permission lookup failed/);assert.equal(saves,0);
+  }
+});
+
+test('secure-save failure remains actionable when GPU launch also fails, without a plaintext fallback',async()=>{
+  const f=guidedFixture([false]);let saves=0;
+  f.deps.saveSavedToken=async()=>{saves++;throw new Error(TOKEN);};f.deps.createSession=async()=>{assert.equal(saves,1);throw new Error('Notebook lookup failed.');};
+  await assert.rejects(launchOpenCode([...launchArgs,'--setup'],f.deps),/Notebook lookup failed/);assert.equal(saves,1);
+  assert(f.logs.some(line=>line.includes('could not be remembered securely')&&line.includes('enter it again next time')&&line.includes('No plaintext token was saved')));assert(!f.logs.join('\n').includes(TOKEN));
+});
+
+test('launcher error diagnostics accept only bounded public recovery fields',async()=>{
+  const f=fixture();f.deps.createSession=async()=>{throw Object.assign(new Error('Notebook lookup failed.'),{launchUncertain:'yes',operation:TOKEN,upstreamStatus:200,retryAfter:86401,providerBody:TOKEN});};
+  await assert.rejects(launchOpenCode(launchArgs,f.deps),error=>{for(const field of ['launchUncertain','operation','upstreamStatus','retryAfter','providerBody'])assert.equal(error[field],undefined);return true;});
+});
+
+test('deleted-notebook confirmation reaches GPU setup only with its explicit CLI flag',async()=>{
+  assert.equal(parseOpenCodeOptions(['--confirm-deleted-notebooks'])['--confirm-deleted-notebooks'],true);
+  for(const confirmed of [false,true]){
+    const f=fixture();f.deps.createSession=async options=>{assert.equal(options.confirmDeletedNotebooks,confirmed?true:undefined);return f.own;};
+    const running=await launchOpenCode([...launchArgs,...(confirmed?['--confirm-deleted-notebooks']:[])],f.deps);await running.close();
+  }
+});
+
+test('deleted-notebook recovery survives the launcher only for its specific code and a safe notebook URL',async()=>{
+  const notebookUrl='https://www.kaggle.com/code/testuser/qwen-agent-'+'a'.repeat(24);
+  for(const patch of [{},{code:'kaggle_unknown'},{canConfirmDeleted:false},{notebookUrl:'https://evil.invalid/code/testuser/qwen-agent-old'},{notebookUrl:notebookUrl+'?token='+TOKEN},{notebookUrl:'https://secret@www.kaggle.com/code/testuser/qwen-agent-old'}]){
+    const f=fixture();f.deps.createSession=async()=>{throw Object.assign(new Error('The old notebook could not be checked.'),{code:'personal_notebook_inaccessible',launchUncertain:true,canConfirmDeleted:true,notebookUrl,...patch});};
+    await assert.rejects(launchOpenCode(launchArgs,f.deps),error=>{const allowed=Object.keys(patch).length===0;assert.equal(error.canConfirmDeleted,allowed?true:undefined);assert.equal(error.notebookUrl,allowed?notebookUrl:undefined);assert.equal(error.launchUncertain,true);assert(!JSON.stringify(error).includes(TOKEN));return true;});
   }
 });
 

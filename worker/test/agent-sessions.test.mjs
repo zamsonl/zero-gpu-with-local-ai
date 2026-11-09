@@ -16,7 +16,7 @@ const accounts=new Map([[ALICE,'alice'],[BOB,'bob']]);
 const clientIds={alice:randomUUID(),bob:randomUUID()};
 const action={action:'answer',message:'Personal Qwen fixture complete.',path:'',content:'',command:'',query:'',offset:0};
 let stack,kaggleServer,aliceModel,bobModel,aliceProxy,bobProxy,alice,bob;
-const pushes=[],calls=[],statuses=new Map(),lostSaveAck=new Set(),saveRefusals=new Map();
+const pushes=[],calls=[],statuses=new Map(),lostSaveAck=new Set(),saveRefusals=new Map(),inventories=new Map(),quotas=new Map();
 async function personalKaggle(req,res){
   let raw='';for await(const chunk of req)raw+=chunk;
   const body=JSON.parse(raw||'{}');const token=(req.headers.authorization||'').replace(/^Bearer /,'');
@@ -24,12 +24,14 @@ async function personalKaggle(req,res){
   const respond=(value,status=200)=>{res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(value));};
   if(!owner)return respond({message:'Rejected supplied test credential.'},401);
   if(req.url.endsWith('/IntrospectToken'))return respond({active:body.token===token,username:owner});
+  if(req.url.endsWith('/ListKernels')){const pages=inventories.get(owner);const result=typeof pages==='function'?await pages(body):pages;return result?.http?respond({error:{message:'Inventory unavailable'}},result.http):respond(result||{});}
+  if(req.url.endsWith('/GetAcceleratorQuotaStatistics')){const result=quotas.get(owner);return result?.http?respond({error:{message:'Quota unavailable'}},result.http):respond(result||{gpuQuota:{timeReserved:'0s'}});}
   if(req.url.endsWith('/SaveKernel')){pushes.push({owner,body});if(lostSaveAck.delete(owner)){req.socket.destroy();return;}const refused=saveRefusals.get(owner);if(refused)return respond(refused.body||{error:{code:refused.status,message:'Dataset permission refused '+token}},refused.status);return respond({versionNumber:1,url:`https://www.kaggle.com/code/${body.slug}`});}
   if(req.url.endsWith('/GetKernelSessionStatus')){const status=statuses.has(body.kernelSlug)?statuses.get(body.kernelSlug):'RUNNING';return typeof status==='object'?respond({error:{message:'Fixture lookup unavailable'}},status.http):respond({status});}
   return respond({message:'No such mocked Kaggle method'},404);
 }
 const jsonRequest=(url,body,headers={})=>fetch(url,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)});
-const bootstrap=(token,client_id=clientIds[accounts.get(token)])=>jsonRequest(stack.url+'/v1/agent/sessions',{kaggle_token:token,consent:true,client_id});
+const bootstrap=(token,client_id=clientIds[accounts.get(token)],extra={})=>jsonRequest(stack.url+'/v1/agent/sessions',{kaggle_token:token,consent:true,client_id,...extra});
 const helper=(session,path,body)=>body===undefined?fetch(session.relay+path,{headers:{'x-relay-key':session.key}}):jsonRequest(session.relay+path,body,{'x-relay-key':session.key});
 const launchToken=session=>/^LAUNCH_TOKEN = "([a-f0-9]{64})"$/m.exec(pushes.find(p=>p.body.slug.endsWith('/qwen-agent-'+session.session_id.slice(0,24))).body.text)[1];
 const notebook=(session,path,body)=>body===undefined?fetch(session.relay+path,{headers:{'x-launch-token':launchToken(session)}}):jsonRequest(session.relay+path,body,{'x-launch-token':launchToken(session)});
@@ -258,9 +260,9 @@ test('lost SaveKernel acknowledgement preserves launch identity without automati
   const retry=await bootstrap(token,launchId);assert.equal(retry.status,200);const recovered=await retry.json();assert.equal(recovered.session_id,session.session_id);assert.equal(recovered.key,session.key);assert.equal(pushes.length,before+1);
 });
 
-async function failedLaunchFixture(owner,{refusalBody}={}){
+async function failedLaunchFixture(owner,{refusalBody,clientId}={}){
   const token='KGAT_'+owner+'_012345678901234567890123';accounts.set(token,owner);saveRefusals.set(owner,{status:400,...(refusalBody?{body:refusalBody}:{})});
-  const response=await bootstrap(token,randomUUID());assert.equal(response.status,502);
+  const response=await bootstrap(token,clientId??randomUUID());assert.equal(response.status,502);
   const error=(await response.json()).error;assert.equal(error.upstream_status,400);assert.equal(error.origin,'kaggle');assert.equal(error.launch_uncertain,false);assert(!JSON.stringify(error).includes(token));
   const metadata=(await stack.sql("SELECT k,v FROM state WHERE k LIKE 'agent:session:%'")).map(row=>({key:row.k,...JSON.parse(row.v)})).find(meta=>meta.owner===owner);
   assert.equal(metadata.launch_error.confirmed_refusal,true);
@@ -301,7 +303,7 @@ for(const state of ['RUNNING',404,503,''])test(`legacy failed reservations recon
   await stack.sql("UPDATE state SET v='"+JSON.stringify(metadata).replaceAll("'","''")+"' WHERE k='agent:session:"+metadata.id+"'");
   await ageLaunchReservation(metadata.id);statuses.set(metadata.slug,typeof state==='number'?{http:state}:state);saveRefusals.delete(owner);
   const before=pushes.length,response=await bootstrap(token,randomUUID());
-  if(state===404){assert.equal(response.status,201);assert.equal(pushes.length,before+1);}
+  if(state===404){assert.equal(response.status,409);assert.equal((await response.json()).error.code,'personal_notebook_inaccessible');assert.equal(pushes.length,before);}
   else{assert.equal(response.status,409);assert.equal((await response.json()).error.code,state==='RUNNING'?'personal_session_active':'personal_launch_unconfirmed');assert.equal(pushes.length,before);}
 });
 
@@ -311,4 +313,74 @@ test('a string provider error is classified without leaking its token or private
   assert.equal(result.error.category,'gpu_quota');assert.equal(result.error.upstream_status,400);
   assert(!JSON.stringify(result).includes('private.trycloudflare.com'));
   assert(!JSON.stringify(result.metadata).includes(token));assert(!JSON.stringify(result.error).includes(token));
+});
+
+async function legacyForbidden(owner,{state='failed',fresh=false,target=false}={}){
+  const {token,metadata}=await failedLaunchFixture(owner);delete metadata.key;delete metadata.launch_error;
+  metadata.launch_state=state;if(!fresh)metadata.created_at=new Date(Date.now()-10*60000).toISOString();
+  await stack.sql("UPDATE state SET v='"+JSON.stringify(metadata).replaceAll("'","''")+"' WHERE k='agent:session:"+metadata.id+"'");
+  if(target)await stack.sql("INSERT INTO state(k,v,updated_at) VALUES('agent:data:"+metadata.id+":target','{}','"+new Date().toISOString()+"')");
+  await ageLaunchReservation(metadata.id);statuses.set(metadata.slug,{http:403});saveRefusals.delete(owner);
+  return {token,metadata};
+}
+test('status403 is not absence: explicit deletion confirmation is required before inventory recovery',async()=>{
+  const {token,metadata}=await legacyForbidden('forbiddenchoice'),before=pushes.length,reads=calls.length;
+  const response=await bootstrap(token,randomUUID());assert.equal(response.status,409);
+  const error=(await response.json()).error;assert.equal(error.code,'personal_notebook_inaccessible');assert.equal(error.can_confirm_deleted,true);
+  assert(error.notebook_url.endsWith('/'+metadata.slug));assert.equal(pushes.length,before);
+  assert(!calls.slice(reads).some(call=>call.path.endsWith('/ListKernels')));
+});
+test('explicit recovery checks every owned page and zero GPU reservation, then retires only old unconfirmed tracking',async()=>{
+  const owner='recoverdeleted',{token,metadata}=await legacyForbidden(owner),before=pushes.length;
+  inventories.set(owner,body=>body.pageToken?{kernels:[]}:{kernels:[{ref:owner+'/unrelated',author:owner,slug:'unrelated',isPrivate:true}],nextPageToken:'next'});
+  const client=randomUUID(),response=await bootstrap(token,client,{confirm_deleted_notebooks:true});assert.equal(response.status,201,JSON.stringify(await response.clone().json()));
+  assert.equal(pushes.length,before+1);
+  const old=JSON.parse((await stack.sql("SELECT v FROM state WHERE k='agent:session:"+metadata.id+"'"))[0].v);
+  assert(old.ended_at);assert.equal(old.recovery.kind,'operator_confirmed_missing_legacy');assert.equal(old.launch_error,undefined);
+  const pages=calls.filter(call=>call.token===token&&call.path.endsWith('/ListKernels'));assert.equal(pages.length,2);
+  assert.equal(pages[0].body.group,'PROFILE');assert.equal(pages[0].body.user,'');assert.equal(pages[1].body.pageToken,'next');assert.equal(pages[1].body.page,undefined);
+  assert.equal((await bootstrap(token,client)).status,200);assert.equal(pushes.length,before+1);
+});
+for(const scenario of ['present','foreign','null-list','loop-page','inventory403','reserved','quota-missing','quota503','unknown','creating','launched','fresh','registered','string-error','quota-envelope','race-progress','race-metadata','race-heartbeat'])test(`deleted-notebook recovery stays blocked for ${scenario}`,async()=>{
+  const owner='blocked'+scenario.replaceAll('-',''),{token,metadata}=await legacyForbidden(owner,{state:['unknown','creating','launched'].includes(scenario)?scenario:'failed',fresh:scenario==='fresh',target:scenario==='registered'}),before=pushes.length;
+  if(scenario==='present')inventories.set(owner,body=>body.pageToken?{kernels:[{ref:owner+'/'+metadata.slug,author:owner,slug:metadata.slug}]}:{kernels:[],nextPageToken:'second'});
+  if(scenario==='foreign')inventories.set(owner,{kernels:[{ref:'anotherowner/missing',author:'anotherowner',slug:'missing'}]});
+  if(scenario==='null-list')inventories.set(owner,{kernels:null});
+  if(scenario==='loop-page')inventories.set(owner,{kernels:[],nextPageToken:'repeat'});
+  if(scenario==='string-error')inventories.set(owner,{code:'403',message:'private error envelope'});
+  if(scenario==='quota-envelope')quotas.set(owner,{code:'403',gpuQuota:{timeReserved:'0s'}});
+  if(scenario.startsWith('race-'))inventories.set(owner,async()=>{
+    if(scenario==='race-metadata')await stack.sql("UPDATE state SET v=json_set(v,'$.launch_state','launched') WHERE k='agent:session:"+metadata.id+"'");
+    else{const key=scenario==='race-progress'?'boot':'client_activity',value=scenario==='race-progress'?{stage:'loading'}:{at:new Date().toISOString()};await stack.sql("INSERT OR REPLACE INTO state(k,v,updated_at) VALUES('agent:data:"+metadata.id+":"+key+"','"+JSON.stringify(value)+"','"+new Date().toISOString()+"')");}
+    return {};
+  });
+  if(scenario==='inventory403')inventories.set(owner,{http:403});
+  if(scenario==='reserved')quotas.set(owner,{gpuQuota:{timeReserved:'0.001s'}});
+  if(scenario==='quota-missing')quotas.set(owner,{});
+  if(scenario==='quota503')quotas.set(owner,{http:503});
+  const response=await bootstrap(token,randomUUID(),{confirm_deleted_notebooks:true});assert(response.status>=400,scenario);assert.equal(pushes.length,before);
+  const old=JSON.parse((await stack.sql("SELECT v FROM state WHERE k='agent:session:"+metadata.id+"'"))[0].v);assert.equal(old.ended_at,undefined);
+  assert(!calls.some(call=>call.token===OWNER));
+});
+test('recovery confirmation cannot be a truthy string',async()=>{
+  const before=calls.length,response=await bootstrap(ALICE,randomUUID(),{confirm_deleted_notebooks:'yes'});assert.equal(response.status,400);assert.equal(calls.length,before);
+});
+
+test('an in-flight reservation with no metadata cannot be bypassed by a second launch identity',async()=>{
+  const owner='reservationgap',token='KGAT_fixture_reservationgap_01234567890123',id='e'.repeat(40);accounts.set(token,owner);
+  const key='agent:rate:'+Buffer.from(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(owner))).toString('hex');
+  await stack.sql("INSERT INTO state(k,v,updated_at) VALUES('"+key+"','"+JSON.stringify({launches:[{id,at:new Date().toISOString()}]})+"','"+new Date().toISOString()+"')");
+  const before=pushes.length,response=await bootstrap(token,randomUUID());assert.equal(response.status,503);assert.equal(pushes.length,before);
+  assert.equal((await response.json()).error.code,'personal_launch_busy');
+  await ageLaunchReservation(id);assert.equal((await bootstrap(token,randomUUID())).status,201);assert.equal(pushes.length,before+1);
+});
+
+for(let round=0;round<3;round++)test(`concurrent creators cannot both submit around an aged orphan reservation (${round})`,async()=>{
+  const owner='orphanrace'+round,clientId=randomUUID(),{token,metadata}=await failedLaunchFixture(owner,{clientId});
+  await stack.sql("DELETE FROM state WHERE k='agent:session:"+metadata.id+"'");
+  await ageLaunchReservation(metadata.id);saveRefusals.delete(owner);
+  const before=pushes.length,responses=await Promise.all([bootstrap(token,clientId),bootstrap(token,randomUUID())]);
+  assert.equal(pushes.length,before+1,'Only one creator may submit to Kaggle');
+  assert.equal(responses.filter(response=>response.status===201).length,1);
+  assert.equal(responses.filter(response=>response.status>=400).length,1);
 });

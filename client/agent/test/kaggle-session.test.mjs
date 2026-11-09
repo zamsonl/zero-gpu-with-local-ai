@@ -11,6 +11,18 @@ const NOW=Date.parse('2026-11-05T00:00:00Z');
 const session=()=>({session_id:SESSION_ID,relay:RELAY_ORIGIN+'/_agent/'+SESSION_ID,key:'helper_private_key_12345678901234567890',host:'kaggle',owner:'testuser',expires_at:new Date(NOW+12*3600000).toISOString(),url:'https://www.kaggle.com/code/testuser/qwen-agent-'+SESSION_ID});
 const response=(value,status=200)=>({ok:status>=200&&status<300,status,json:async()=>value});
 
+test('deleted-notebook choice is explicit and only safe recovery metadata reaches setup',async()=>{
+  let body;await createOwnKaggleSession({token:TOKEN,consent:true,confirmDeletedNotebooks:true,now:NOW,fetcher:async(_url,options)=>{body=JSON.parse(options.body);return response(session());}});assert.equal(body.confirm_deleted_notebooks,true);
+  await assert.rejects(createOwnKaggleSession({token:TOKEN,consent:true,confirmDeletedNotebooks:'yes'}),/explicit choice/);
+  const notebook='https://www.kaggle.com/code/testuser/qwen-agent-'+ 'a'.repeat(24);
+  for(const url of [notebook,notebook+'?token='+TOKEN,'https://attacker.invalid/code/testuser/qwen-agent-'+ 'a'.repeat(24)]){
+    await assert.rejects(createOwnKaggleSession({token:TOKEN,consent:true,fetcher:async()=>Response.json({error:{code:'personal_notebook_inaccessible',can_confirm_deleted:true,notebook_url:url,launch_uncertain:true,message:TOKEN}},{status:409})}),error=>{
+      assert.equal(error.code,'personal_notebook_inaccessible');assert.equal(error.launchUncertain,true);assert(!error.message.includes(TOKEN));
+      assert.equal(error.canConfirmDeleted,url===notebook?true:undefined);assert.equal(error.notebookUrl,url===notebook?notebook:undefined);return true;
+    });
+  }
+});
+
 test('personal bootstrap sends only explicit personal token and consent to the fixed origin',async()=>{
   let request;
   const result=await createOwnKaggleSession({token:TOKEN,consent:true,clientId:CLIENT_ID,now:NOW,fetcher:async(url,options)=>{request={url,options};return response({...session(),kaggle_token:'must not be retained',unexpected:'drop'});}});

@@ -5,7 +5,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn} from 'node:child_process';
 import {randomBytes,timingSafeEqual} from 'node:crypto';
-import {launchOpenCode,openProjectFolder,openKaggleTokenPage,chooseBrowserChannel} from './opencode.mjs';
+import {launchOpenCode,openProjectFolder,openKaggleTokenPage,chooseBrowserChannel,recoveryNotebookUrl} from './opencode.mjs';
 import {cleanChildEnvironment,OPENCODE_VERSION,PLAYWRIGHT_MCP_VERSION} from './opencode-config.mjs';
 import {DEFAULT_CREDENTIAL_PATH,secureTokenStorageAvailable,forgetKaggleToken} from './credential-store.mjs';
 import {validateModelUrl} from './kaggle-session.mjs';
@@ -28,7 +28,7 @@ export async function createSetupController(deps={}){
   const snapshot=()=>structuredClone(state);
   const publish=()=>{for(const [listener,needsSnapshot] of listeners){try{listener(needsSnapshot?snapshot():undefined);}catch{}}};
   const set=(patch)=>{state={...state,...patch};publish();};
-  const event=(text,{stage=state.phase,level='info',source}={})=>{const line=safeSetupText(text);if(!line)return;state.events.push({id:++sequence,time:new Date().toISOString(),level,stage,text:line,...(source?{source}:{})});state.events=state.events.slice(-180);publish();};
+  const event=(text,{stage=state.phase,level='info',source}={})=>{const line=safeSetupText(text);if(!line)return;const previous=state.events.at(-1);if(previous?.text===line&&previous.level===level&&previous.stage===stage&&previous.source===source)return;state.events.push({id:++sequence,time:new Date().toISOString(),level,stage,text:line,...(source?{source}:{})});state.events=state.events.slice(-180);publish();};
   const progress=value=>{
     if(!value||closed)return;
     let phase=value.stage;
@@ -41,7 +41,7 @@ export async function createSetupController(deps={}){
     const patch={phase,title:phase==='installing'&&value.source==='notebook'?'Preparing the cloud runtime':state.modelUrl&&phase==='loading'?'Loading your selected model on the GPUs':state.modelUrl&&phase==='connecting'?'Connecting to your selected model':TITLES[phase],detail,connection:value.connection||null,source:value.source||null,lastStage:value.stage,percent:Number.isFinite(value.percent)?Math.max(0,Math.min(100,value.percent)):null};
     if(typeof value.owner==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(value.owner))patch.owner=value.owner;
     if(typeof value.notebookUrl==='string'&&/^https:\/\/www\.kaggle\.com\/code\/[A-Za-z0-9_/-]+$/.test(value.notebookUrl))patch.notebookUrl=value.notebookUrl;
-    set(patch);const key=JSON.stringify([value.stage,detail,value.line||'',value.percent??null,value.connection||null,value.source||null]);if(key===lastProgress)return;lastProgress=key;event(value.line||detail,{stage:value.stage,level:value.state==='error'?'error':'info',source:value.source});
+    set(patch);const key=JSON.stringify([value.stage,value.state,detail,value.line||'',value.percent??null,value.connection||null,value.source||null]);if(key===lastProgress)return;lastProgress=key;event(value.line||detail,{stage:value.stage,level:value.state==='error'?'error':'info',source:value.source});
   };
   const savePreferences=async()=>{await fs.mkdir(path.dirname(preferenceFile),{recursive:true});const temporary=preferenceFile+'.'+randomBytes(8).toString('hex')+'.tmp';try{await fs.writeFile(temporary,JSON.stringify({version:1,folder:state.folder,browser:state.browser,modelUrl:state.modelUrl,...(pendingLaunch?{pendingLaunch}:{})})+'\n',{flag:'wx',mode:0o600});await fs.rename(temporary,preferenceFile);}finally{await fs.rm(temporary,{force:true}).catch(()=>{});}};
   const controller={
@@ -53,7 +53,9 @@ export async function createSetupController(deps={}){
     start(input){
       if(closed||active||pickerAbort)throw failure('A setup or coding session is already active.','setup_busy',409);
       if(!input||typeof input!=='object'||Array.isArray(input))throw failure('Supply your setup choices.');
-      for(const key of Object.keys(input))if(!['folder','token','rememberToken','browser','installConsent','gpuConsent','modelUrl'].includes(key))throw failure('Unsupported setup choice.');
+      for(const key of Object.keys(input))if(!['folder','token','rememberToken','browser','installConsent','gpuConsent','modelUrl','confirmDeletedNotebooks'].includes(key))throw failure('Unsupported setup choice.');
+      if(input.confirmDeletedNotebooks!==undefined&&typeof input.confirmDeletedNotebooks!=='boolean')throw failure('Confirm deleted notebooks using the recovery checkbox.','invalid_recovery_confirmation');
+      if(input.confirmDeletedNotebooks===true&&(!pendingLaunch||state.error?.code!=='personal_notebook_inaccessible'||state.error.canConfirmDeleted!==true||!recoveryNotebookUrl(state.error.notebookUrl)))throw failure('Check the same launch first. Recovery is available only for the inaccessible old notebook shown in setup.','recovery_not_available',409);
       if(typeof input.folder!=='string'||!input.folder.trim()||input.folder.length>32768)throw failure('Choose an existing project folder.','folder_required');
       if(input.gpuConsent!==true)throw failure('Confirm using your own Kaggle GPU allowance before starting.','consent_required');
       if(input.token!==undefined&&(typeof input.token!=='string'||input.token.length>300))throw failure('Enter your Kaggle token in the password field.','invalid_token');
@@ -66,7 +68,7 @@ export async function createSetupController(deps={}){
       pendingLaunch??={id:randomBytes(16).toString('hex'),modelUrl};
       lastProgress='';active=true;uncertain=false;abort=new AbortController();let blockedInstall=false;
       set({phase:'checking',title:TITLES.checking,detail:'Validating the selected project and reviewed local tools.',folder:input.folder.trim(),modelUrl,browser:input.browser!==false,running:false,canRetry:false,error:null,notebookUrl:null,owner:null,percent:null,startedAt:new Date().toISOString(),endedAt:null});event('Setup started. GPU usage requires your confirmed personal account.');
-      const args=['--setup','--launch-id',pendingLaunch.id,'--folder',state.folder,...(modelUrl?['--model-url',modelUrl]:[]),...(!state.browser?['--no-browser']:[]),...(input.rememberToken===false?['--no-remember-token']:[])];
+      const args=['--setup','--launch-id',pendingLaunch.id,'--folder',state.folder,...(modelUrl?['--model-url',modelUrl]:[]),...(!state.browser?['--no-browser']:[]),...(input.rememberToken===false?['--no-remember-token']:[]),...(input.confirmDeletedNotebooks===true?['--confirm-deleted-notebooks']:[])];
       work=(async()=>{
         try{
           // Persist the non-secret identity before any remote launch. Explicit
@@ -91,10 +93,12 @@ export async function createSetupController(deps={}){
           set({phase:result?.code===0||abort.signal.aborted?'stopped':'error',title:result?.code===0||abort.signal.aborted?TITLES.stopped:TITLES.error,detail:result?.code===0||abort.signal.aborted?'OpenCode closed. Shutdown was requested; check Kaggle to confirm it stopped.':'OpenCode exited with an error. Shutdown was requested; review the event log and check Kaggle.',running:false,canRetry:true,endedAt:new Date().toISOString()});
         }catch(error){
           token='';uncertain=typeof error?.launchUncertain==='boolean'?error.launchUncertain:/unconfirmed|uncertain|did not confirm|could not be confirmed|check your own kaggle|launch confirmation|unreadable personal-session|invalid personal kaggle|invalid personal-session/i.test(error?.message||'')||error?.code==='kaggle_unknown';
+          try{set({rememberedToken:await(deps.hasRememberedToken||remembered)()});}catch{/* Keep the last known credential state if storage cannot be checked. */}
           if(!uncertain)pendingLaunch=null;
           await savePreferences().catch(()=>{});
           const message=safeSetupText(error?.message||'Setup failed. Review the last completed stage.');
-          set({phase:abort.signal.aborted?'stopped':'error',title:abort.signal.aborted?TITLES.stopped:TITLES.error,detail:message+(uncertain?' Retry checks the same saved launch reference.':''),retrySameLaunch:uncertain,running:false,canRetry:true,endedAt:new Date().toISOString(),error:{message,code:typeof error?.code==='string'?error.code:'setup_failed'}});event(message,{level:'error'});
+          const notebookUrl=error?.code==='personal_notebook_inaccessible'&&error.canConfirmDeleted===true?recoveryNotebookUrl(error.notebookUrl):null;
+          set({phase:abort.signal.aborted?'stopped':'error',title:abort.signal.aborted?TITLES.stopped:TITLES.error,detail:message+(uncertain?' Retry checks the same saved launch reference.':'')+(notebookUrl?' Recovery resets only stale unlaunched tracking after your confirmation and Kaggle checks; it does not delete Kaggle files.':''),retrySameLaunch:uncertain,running:false,canRetry:true,endedAt:new Date().toISOString(),...(notebookUrl?{notebookUrl}:{}),error:{message,code:typeof error?.code==='string'?error.code:'setup_failed',...(notebookUrl?{canConfirmDeleted:true,notebookUrl}:{})}});event(message,{stage:error?.stage||state.lastStage||state.phase,level:'error'});
         }finally{token='';launch=null;active=false;publish();}
       })();
       return snapshot();

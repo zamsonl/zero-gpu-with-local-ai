@@ -16,7 +16,7 @@ import {OPENCODE_VERSION,PLAYWRIGHT_MCP_VERSION,BROWSER_CHANNELS,MODEL,OPEN_CODE
 
 export function parseOpenCodeOptions(args){
   const values=new Set(['--folder','--tools-dir','--state-dir','--opencode-bin','--kaggle-token-file','--launch-id','--session','--browser','--model-url']);
-  const flags=new Set(['--setup','--no-browser','--no-remember-token','--forget-kaggle-token','--install-opencode','--install-browser','--with-browser','--consent-kaggle-gpu','--continue','--help']);
+  const flags=new Set(['--setup','--no-browser','--no-remember-token','--forget-kaggle-token','--install-opencode','--install-browser','--with-browser','--consent-kaggle-gpu','--confirm-deleted-notebooks','--continue','--help']);
   const options={};
   for(let i=0;i<args.length;i++){
     const name=args[i];
@@ -53,6 +53,7 @@ const help=`Run OpenCode with Qwen in your own private Kaggle notebook.
   --opencode-bin PATH      Use an existing native OpenCode ${OPENCODE_VERSION} executable
   --kaggle-token-file PATH Read your own private token file instead of hidden entry
   --consent-kaggle-gpu     Explicit consent to use your own Kaggle GPU allowance
+  --confirm-deleted-notebooks Confirm you deleted old coding notebooks and none are running or queued
   --launch-id ID           Reuse a printed launch reference only for an explicit retry
 Without --folder, Windows shows a folder picker. Ctrl+C or exiting OpenCode requests
 shutdown of this personal notebook. Other providers and automatic approvals are disabled.`;
@@ -98,6 +99,10 @@ export function emitSetupProgress(observer,event,secrets=[]){
 function safeSetupError(error,secrets,fallback){
   const detail=sanitizeSetupText(error?.message,secrets,{maxLength:600});
   return detail.replace(/\[(?:redacted|redacted credential|private tunnel)\]/g,'').replace(/[\s:;,.\-]+/g,'').length>=4?detail:fallback;
+}
+
+export function recoveryNotebookUrl(value){
+  try{const url=new URL(value);return url.origin==='https://www.kaggle.com'&&!url.username&&!url.password&&!url.search&&!url.hash&&/^\/code\/[A-Za-z0-9_-]{1,64}\/qwen-agent-[A-Za-z0-9_-]{1,160}\/?$/.test(url.pathname)?url.href:null;}catch{return null;}
 }
 
 
@@ -378,7 +383,13 @@ export async function launchOpenCode(args=process.argv.slice(2),dependencies={})
     }
     const message=safeSetupError(error,[...secrets],'OpenCode startup failed during '+STAGE_LABELS[failedStage].toLowerCase()+'.');
     progress({stage:failedStage,state:'error',detail:message,failedStage});
-    throw Object.assign(new Error(message),{name:error?.name||'Error',stage:failedStage,...(error?.code?{code:error.code}:{})});
+    const notebookUrl=error?.code==='personal_notebook_inaccessible'&&error.canConfirmDeleted===true?recoveryNotebookUrl(error.notebookUrl):null;
+    throw Object.assign(new Error(message),{name:error?.name||'Error',stage:failedStage,...(error?.code?{code:error.code}:{}),
+      ...(typeof error?.launchUncertain==='boolean'?{launchUncertain:error.launchUncertain}:{}),
+      ...(['SaveKernel','GetKernelSessionStatus','IntrospectToken','PrepareKernel','ListKernels','GetAcceleratorQuotaStatistics'].includes(error?.operation)?{operation:error.operation}:{}),
+      ...(Number.isInteger(error?.upstreamStatus)&&error.upstreamStatus>=400&&error.upstreamStatus<=599?{upstreamStatus:error.upstreamStatus}:{}),
+      ...(Number.isInteger(error?.retryAfter)&&error.retryAfter>0&&error.retryAfter<=86400?{retryAfter:error.retryAfter}:{}),
+      ...(notebookUrl?{canConfirmDeleted:true,notebookUrl}:{})});
   }
 }
 
@@ -500,17 +511,20 @@ async function launchOpenCodeInner(args,dependencies,context){
     stage('cache','running','Checking your private persistent cache. First use prepares it on a CPU notebook before allocating GPUs.');
     const cache=await(dependencies.prepareCache||prepareOwnCache)({token,consent:true,modelUrl,signal:dependencies.signal,onProgress:progress});
     if(cancelled())return null;
+    // Cache readiness follows token introspection and validation of the owned,
+    // pinned Dataset. Remember that authenticated token even if GPU launch fails.
+    if(setup&&manualToken&&!options['--no-remember-token']&&(dependencies.secureStorageAvailable||secureTokenStorageAvailable)()){
+      try{await(dependencies.saveSavedToken||saveKaggleToken)(token);log('Kaggle token accepted and remembered with Windows user encryption.');}
+      catch{log('Your token was accepted but could not be remembered securely. This run can continue; enter it again next time. No plaintext token was saved.');}
+    }
+    if(cancelled())return null;
     stage('launching','running','Starting your private GPU notebook with the prepared cache.');
-    session=await(dependencies.createSession||createOwnKaggleSession)({token,consent:true,clientId,...(cache?.cache_id?{cacheId:cache.cache_id}:{}),...(modelUrl?{modelUrl}:{})});
+    session=await(dependencies.createSession||createOwnKaggleSession)({token,consent:true,clientId,...(cache?.cache_id?{cacheId:cache.cache_id}:{}),...(modelUrl?{modelUrl}:{}),...(options['--confirm-deleted-notebooks']?{confirmDeletedNotebooks:true}:{})});
     if(typeof session?.key==='string')context.secrets.add(session.key);
     session=validatePersonalSession(session,{requireFresh:false});
     startupToken=token;
     stage('token','complete','Kaggle accepted the token for '+session.owner+'.');
     stage('queued','running',session.launch_state==='unknown'||session.launch_state==='creating'?'Notebook submission is unconfirmed. Checking this same launch reference; another notebook will not be submitted.':'Kaggle accepted your private notebook. Waiting for its first startup report.',{owner:session.owner,notebookUrl:session.url,launchId:clientId});
-    if(!cancelled()&&setup&&manualToken&&!options['--no-remember-token']&&(dependencies.secureStorageAvailable||secureTokenStorageAvailable)()){
-      try{await(dependencies.saveSavedToken||saveKaggleToken)(token);log('Kaggle token accepted and remembered with Windows user encryption.');}
-      catch{log('Your token was accepted but could not be remembered securely. This run can continue; enter it again next time. No plaintext token was saved.');}
-    }
   }
   catch(error){
     if(remembered&&(error?.status===401||error?.status===403||/^Your Kaggle token was not accepted\./.test(error?.message||'')))throw new Error('The saved Kaggle token was rejected. Run node opencode.mjs --forget-kaggle-token, then run setup again. No owner account fallback was used.');

@@ -77,14 +77,46 @@ async function kaggleCall(env,token,service,method,body,fetcher){
       `Kaggle ${confirmed_refusal?'refused':'did not confirm'} ${method} (HTTP ${response.status}; ${category}). ${confirmed_refusal?'No accepted launch was confirmed.':'Check the same launch reference before starting another notebook.'}`,
       {origin:'kaggle',operation:method,upstream_status:response.status,...(upstream_code===undefined?{}:{upstream_code}),category,confirmed_refusal,launch_uncertain:!confirmed_refusal});
   }
-  const result=await response.json().catch(()=>null);
-  if(!result||result.error)throw new HttpError(502,'kaggle_unknown','Kaggle returned an unconfirmed result. Retry the same launch reference to check it.',{origin:'kaggle',operation:method,launch_uncertain:true});
+  const result=await (['ListKernels','GetAcceleratorQuotaStatistics'].includes(method)?readJsonObject(response,256*1024):response.json()).catch(()=>null);
+  if(!result||result.error||Number.isInteger(result.code)&&result.code>=400)throw new HttpError(502,'kaggle_unknown','Kaggle returned an unconfirmed result. Retry the same launch reference to check it.',{origin:'kaggle',operation:method,launch_uncertain:true});
   return result;
 }
 
 const terminalKaggleStatus=status=>['COMPLETE','ERROR','CANCELED','CANCELLED','CANCEL_ACKNOWLEDGED'].includes(String(status||'').toUpperCase());
 const rejectedLaunch=meta=>meta?.launch_state==='failed'&&(meta.launch_error?.confirmed_refusal===true||meta.launch_error?.submission_sent===false);
-async function reconcileLaunch(db,meta,env,token,fetcher){
+const legacyUnconfirmed=meta=>meta?.launch_state==='failed'&&!meta.launch_error&&meta.version==null;
+function inaccessibleNotebook(meta,status=403){
+  const recoverable=legacyUnconfirmed(meta);
+  return new HttpError(409,'personal_notebook_inaccessible','Kaggle cannot access an earlier coding notebook. Retrying alone cannot establish whether it was deleted. Check the notebook in your account; only use deleted-notebook recovery after confirming the old coding notebooks are not running or queued.',{origin:'kaggle',operation:'GetKernelSessionStatus',upstream_status:status,launch_uncertain:true,can_confirm_deleted:recoverable,notebook_url:`https://www.kaggle.com/code/${meta.owner}/${meta.slug}`});
+}
+
+// PROFILE is the official CLI's --mine inventory. Absence and zero reserved
+// quota are corroboration, not a deletion guarantee; explicit operator deletion
+// confirmation is also required. This never resets an ambiguous accepted job.
+async function deletionEvidence(env,token,owner,fetcher){
+  const refs=new Set(),seen=new Set();let pageToken='';
+  for(let page=0;page<8;page++){
+    const result=await kaggleCall(env,token,'kernels.KernelsApiService','ListKernels',{group:'PROFILE',user:'',language:'all',kernelType:'all',outputType:'all',pageSize:100,...(pageToken?{pageToken}:{page:1})},fetcher);
+    if(Object.keys(result).some(key=>!['kernels','nextPageToken'].includes(key)))throw new HttpError(409,'personal_inventory_unconfirmed','Kaggle did not return a notebook inventory. No stale record was reset.',{launch_uncertain:true});
+    const kernels=result.kernels===undefined?[]:result.kernels,next=result.nextPageToken===undefined?'':result.nextPageToken;
+    if(!Array.isArray(kernels)||kernels.length>100||typeof next!=='string'||next.length>4096)throw new HttpError(409,'personal_inventory_unconfirmed','Kaggle returned an incomplete notebook inventory. No stale record was reset.',{launch_uncertain:true});
+    for(const item of kernels){
+      const ref=item?.ref;
+      if(typeof ref!=='string'||!new RegExp('^'+owner+'/[A-Za-z0-9_-]+$','i').test(ref)||item.author!==undefined&&(typeof item.author!=='string'||item.author.toLowerCase()!==owner.toLowerCase())||item.slug!==undefined&&(typeof item.slug!=='string'||item.slug.toLowerCase()!==ref.split('/')[1].toLowerCase()))throw new HttpError(409,'personal_inventory_unconfirmed','Kaggle did not return a verifiable inventory for this account. No stale record was reset.',{launch_uncertain:true});
+      refs.add(ref.toLowerCase());
+    }
+    if(!next){
+      const quota=await kaggleCall(env,token,'kernels.KernelsApiService','GetAcceleratorQuotaStatistics',{},fetcher);
+      if(Object.keys(quota).some(key=>!['gpuQuota','tpuQuota','quotaRefreshTime'].includes(key))||typeof quota.gpuQuota?.timeReserved!=='string'||!/^0(?:\.0{1,9})?s$/.test(quota.gpuQuota.timeReserved))throw new HttpError(409,'personal_gpu_state_unconfirmed','Kaggle reports reserved GPU time or did not confirm the GPU reservation state. Check running and queued notebooks before resetting old tracking.',{origin:'kaggle',operation:'GetAcceleratorQuotaStatistics',launch_uncertain:true});
+      return refs;
+    }
+    if(seen.has(next))break;
+    seen.add(next);pageToken=next;
+  }
+  throw new HttpError(409,'personal_inventory_unconfirmed','The complete notebook inventory could not be checked within the connection budget. No stale record was reset.',{launch_uncertain:true});
+}
+
+async function reconcileLaunch(db,meta,env,token,fetcher,recovery){
   if(rejectedLaunch(meta)||meta.ended_at)return meta;
   try{
     const result=await kaggleCall(env,token,'kernels.KernelsApiService','GetKernelSessionStatus',{userName:meta.owner,kernelSlug:meta.slug},fetcher);
@@ -92,28 +124,49 @@ async function reconcileLaunch(db,meta,env,token,fetcher){
     const updated={...meta,launch_state:'launched',reconciled_at:now(),kaggle_status:String(result.status).toUpperCase(),...(terminalKaggleStatus(result.status)?{ended_at:now()}:{} )};
     await write(db,metaKey(meta.id),updated);return updated;
   }catch(error){
-    // Old releases marked every HTTP error as failed, including ambiguous5xx.
-    // Only a failed legacy record now confirmed absent can leave the launch quota.
-    // Unknown/creating records retain their reservation even on an early404.
-    if(meta.launch_state==='failed'&&error?.extra?.upstream_status===404){
-      const updated={...meta,reconciled_at:now(),launch_error:{code:'kaggle_not_found',origin:'kaggle',operation:'GetKernelSessionStatus',upstream_status:404,confirmed_refusal:true}};
-      await write(db,metaKey(meta.id),updated);return updated;
+    if([403,404].includes(error?.extra?.upstream_status)){
+      if(recovery?.confirmed&&legacyUnconfirmed(meta)&&meta.owner.toLowerCase()===recovery.owner.toLowerCase()){
+        const age=Date.now()-Date.parse(meta.created_at);
+        const [target,heartbeat,boot]=await Promise.all([read(db,prefix(meta.id)+'target'),read(db,prefix(meta.id)+'client_activity'),read(db,prefix(meta.id)+'boot')]);
+        if(!Number.isFinite(age)||age<4*60000||target||clientActive(heartbeat)||boot&&!['queued','failed'].includes(boot.stage))throw inaccessibleNotebook(meta,error.extra.upstream_status);
+        recovery.evidence??=deletionEvidence(env,token,recovery.owner,fetcher);
+        const refs=await recovery.evidence;
+        if(refs.has((meta.owner+'/'+meta.slug).toLowerCase()))throw inaccessibleNotebook(meta,error.extra.upstream_status);
+        // Remote checks may be slow. Re-read local activity and fence the final
+        // update against callbacks/reconciliation arriving while they ran.
+        const keys=[metaKey(meta.id),prefix(meta.id)+'target',prefix(meta.id)+'client_activity',prefix(meta.id)+'boot'];
+        const rows=await Promise.all(keys.map(key=>db.prepare('SELECT v FROM state WHERE k = ?1').bind(key).first()));
+        const fresh=rows[0]?JSON.parse(rows[0].v):null,h=rows[2]?JSON.parse(rows[2].v):null,b=rows[3]?JSON.parse(rows[3].v):null;
+        if(!legacyUnconfirmed(fresh)||fresh.ended_at||fresh.owner!==meta.owner||fresh.slug!==meta.slug||rows[1]||clientActive(h)||b&&!['queued','failed'].includes(b.stage))throw inaccessibleNotebook(meta,error.extra.upstream_status);
+        const updated={...fresh,ended_at:now(),reconciled_at:now(),recovery:{kind:'operator_confirmed_missing_legacy',inventory_checked:true,gpu_reserved:'0s'}};
+        const changed=await db.prepare("UPDATE state SET v = ?1, updated_at = ?2 WHERE k = ?3 AND v = ?4 AND NOT EXISTS(SELECT 1 FROM state WHERE k = ?5) AND COALESCE((SELECT v FROM state WHERE k = ?6),'') = ?7 AND COALESCE((SELECT v FROM state WHERE k = ?8),'') = ?9").bind(JSON.stringify(updated),now(),keys[0],rows[0].v,keys[1],keys[2],rows[2]?.v??'',keys[3],rows[3]?.v??'').run();
+        if(changed.meta.changes!==1)throw inaccessibleNotebook(meta,error.extra.upstream_status);
+        return updated;
+      }
+      throw inaccessibleNotebook(meta,error.extra.upstream_status);
     }
     throw new HttpError(409,'personal_launch_unconfirmed','The previous notebook state could not be verified. Retry the same launch reference; another GPU notebook was not submitted.',{origin:error?.extra?.origin==='kaggle'?'kaggle':'connector',operation:'GetKernelSessionStatus',launch_uncertain:true,...(error?.extra?.upstream_status?{upstream_status:error.extra.upstream_status}:{} )});
   }
 }
 
-async function reserveLaunch(db,owner,id,env,token,fetcher){
+async function reserveLaunch(db,owner,id,env,token,fetcher,recovery){
   const key='agent:rate:'+await digest(owner.toLowerCase());
   for(let attempt=0;attempt<4;attempt++){
     const row=await db.prepare('SELECT v FROM state WHERE k = ?1').bind(key).first();
     const previous=row?JSON.parse(row.v):{launches:[]};
     const cutoff=Date.now()-24*3600000;
-    const recent=previous.launches.filter(x=>Date.parse(x.at)>cutoff),counted=[],rejected=[];
+    const recent=previous.launches.filter(x=>Date.parse(x.at)>cutoff),counted=[],rejected=[],orphanKeys=[];
     if(recent.some(x=>x.id===id))return;
     for(const item of recent){
       let active=await read(db,metaKey(item.id));
-      if(active&&!active.ended_at&&Date.parse(active.expires_at)>Date.now())active=await reconcileLaunch(db,active,env,token,fetcher);
+      if(!active){
+        if(Date.now()-Date.parse(item.at)<4*60000)throw new HttpError(503,'personal_launch_busy','A personal launch reservation is still being prepared. Check the same launch reference before starting another.',{origin:'connector',launch_uncertain:true});
+        // No submit is allowed without metadata and a still-owned reservation.
+        // A late creator is fenced again immediately before SaveKernel below.
+        orphanKeys.push(metaKey(item.id));
+        continue;
+      }
+      if(active&&!active.ended_at&&Date.parse(active.expires_at)>Date.now())active=await reconcileLaunch(db,active,env,token,fetcher,recovery);
       if(rejectedLaunch(active)){rejected.push(item);continue;}
       counted.push(item);
       if(!active||active.ended_at||Date.parse(active.expires_at)<=Date.now())continue;
@@ -124,7 +177,10 @@ async function reserveLaunch(db,owner,id,env,token,fetcher){
     const delay=Math.max(0,...counted.map(x=>4*60000-(Date.now()-Date.parse(x.at))));
     if(counted.length>=8||delay>0)throw new HttpError(429,'personal_launch_limit','The connector safety limit was reached. Reuse the existing launch reference; replacing the Kaggle token does not change this account limit.',{origin:'connector',limit_kind:counted.length>=8?'daily':'cooldown',retry_after_seconds:Math.ceil((counted.length>=8?Math.min(...counted.map(x=>Date.parse(x.at)+24*3600000-Date.now())):delay)/1000),launch_uncertain:false});
     const next=JSON.stringify({launches:[...counted,...rejected.filter(x=>Date.now()-Date.parse(x.at)<30_000),{id,at:now()}]});
-    const changed=row?await db.prepare('UPDATE state SET v = ?1, updated_at = ?2 WHERE k = ?3 AND v = ?4').bind(next,now(),key,row.v).run():await db.prepare('INSERT OR IGNORE INTO state (k, v, updated_at) VALUES (?1, ?2, ?3)').bind(key,next,now()).run();
+    // An orphan's metadata may appear after the lookup above. Do not remove its
+    // reservation in that ordering; the late creator fences the opposite one.
+    const orphanFence=orphanKeys.length?' AND NOT EXISTS(SELECT 1 FROM state WHERE k IN ('+orphanKeys.map((_,index)=>'?'+(index+5)).join(',')+'))':'';
+    const changed=row?await db.prepare('UPDATE state SET v = ?1, updated_at = ?2 WHERE k = ?3 AND v = ?4'+orphanFence).bind(next,now(),key,row.v,...orphanKeys).run():await db.prepare('INSERT OR IGNORE INTO state (k, v, updated_at) VALUES (?1, ?2, ?3)').bind(key,next,now()).run();
     if(changed.meta.changes){
       // Only this authenticated owner's expired session namespaces are eligible for cleanup.
       for(const old of previous.launches.filter(x=>!recent.some(y=>x.id===y.id)).slice(0,8)){
@@ -147,6 +203,7 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
   try{
     const body=await readJsonObject(request,8192);
     if(body.consent!==true)throw new HttpError(400,'consent_required','Confirm that starting your own Kaggle GPU session consumes your allowance.');
+    if(body.confirm_deleted_notebooks!==undefined&&typeof body.confirm_deleted_notebooks!=='boolean')throw new HttpError(400,'invalid_recovery_confirmation','Deleted-notebook recovery requires an explicit boolean choice.');
     if(typeof body.kaggle_token!=='string'||!TOKEN.test(body.kaggle_token))throw new HttpError(400,'personal_token_required','Enter your own Kaggle API token. Saved owner credentials are never used.');
     const requestedModel=body.model_url===undefined||body.model_url===''?null:huggingFaceSource(body.model_url);
     const clientId=body.client_id??crypto.randomUUID();
@@ -154,6 +211,7 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
     const info=await kaggleCall(env,body.kaggle_token,'security.OAuthService','IntrospectToken',{token:body.kaggle_token},fetcher);
     if(info.active!==true||typeof info.username!=='string'||!/^[A-Za-z0-9_-]{1,64}$/.test(info.username))throw new HttpError(401,'personal_token_invalid','The supplied Kaggle token is not active for a valid account.');
     const owner=info.username;
+    const recovery={owner,confirmed:body.confirm_deleted_notebooks===true};
     const id=(await derived(env.RELAY_KEY,'agent-session:'+owner.toLowerCase()+':'+clientId)).slice(0,40);
     const key=await derived(env.RELAY_KEY,'agent-helper:'+id);
     const launchToken=await derived(env.RELAY_KEY,'agent-notebook:'+id);
@@ -162,14 +220,14 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
       if((existing.model?.url||null)!==(requestedModel?.url||null))throw new HttpError(409,"personal_model_changed","This launch identity belongs to another model. Stop its notebook before starting a different model.");
       if(existing.owner!==owner||Date.parse(existing.expires_at)<=Date.now())throw new HttpError(409,'personal_session_expired','This launch identity has expired. Start a new helper launch after checking your notebook.',{origin:'connector',launch_uncertain:false});
       if(!(await equalHash(key,existing.helper_hash)))throw new HttpError(409,'personal_session_changed','The relay signing key changed. Check the old notebook before launching again.');
-      if(['failed','unknown','creating'].includes(existing.launch_state))existing=await reconcileLaunch(env.DB,existing,env,body.kaggle_token,fetcher);
+      if(['failed','unknown','creating'].includes(existing.launch_state))existing=await reconcileLaunch(env.DB,existing,env,body.kaggle_token,fetcher,recovery);
       if(rejectedLaunch(existing))throw new HttpError(502,'personal_launch_refused','The previous notebook submission was refused or confirmed absent. Retry creates a new launch reference after the short retry delay.',{...existing.launch_error,origin:existing.launch_error?.origin||'connector',launch_uncertain:false});
       if(existing.ended_at)throw new HttpError(409,'personal_session_ended','The notebook for this launch reference has finished. Start a new helper launch.',{origin:'connector',launch_uncertain:false});
       return json(descriptor(new URL(request.url).origin,existing,key),existing.launch_state==='creating'?202:200);
     }
     const personalCache=body.cache_id?await readyPersonalCache({env,owner,cacheId:body.cache_id,modelUrl:requestedModel?.url||null}):null;
     const model=personalCache?personalCache.model:requestedModel?await resolveModel(body.model_url,{fetcher}):null;
-    await reserveLaunch(env.DB,owner,id,env,body.kaggle_token,fetcher);
+    await reserveLaunch(env.DB,owner,id,env,body.kaggle_token,fetcher,recovery);
     const slug='qwen-agent-'+id.slice(0,24);
     const metadata={id,owner,...(model?{model}:{}),created_at:now(),expires_at:new Date(Date.now()+SESSION_HOURS*3600000).toISOString(),helper_hash:await digest(key),launch_hash:await digest(launchToken),launch_state:'creating',url:`https://www.kaggle.com/code/${owner}/${slug}`,slug};
     const created=await env.DB.prepare('INSERT OR IGNORE INTO state (k, v, updated_at) VALUES (?1, ?2, ?3)').bind(metaKey(id),JSON.stringify(metadata),now()).run();
@@ -178,6 +236,8 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
     const cacheDataset=personalCache?.dataset||(!model&&typeof env.KAGGLE_CACHE_DATASET==='string'&&/^[a-z0-9_-]+\/[a-z0-9_-]+\/\d+$/i.test(env.KAGGLE_CACHE_DATASET)&&env.KAGGLE_CACHE_DATASET.split('/')[0].toLowerCase()===owner.toLowerCase()?env.KAGGLE_CACHE_DATASET:null);
     let payload;
     try{
+      const reservation=await read(env.DB,'agent:rate:'+await digest(owner.toLowerCase()));
+      if(!reservation?.launches?.some(item=>item.id===id))throw new Error('Launch reservation was superseded before submission.');
       await write(env.DB,prefix(id)+'boot',{host:'kaggle',stage:'queued',detail:'Notebook submitted to Kaggle. Waiting for the first startup report; GPU queue state is not yet confirmed.',at:now()});
       payload={slug:`${owner}/${slug}`,newTitle:'Qwen Local Coding Agent',text:serverScript({relay:base,token:launchToken,quant:model?.quant||'Q5_K_P',contexts:model?[32768,24576,16384,8192]:[98304],vision:false,cacheId:personalCache?.cache_id||(cacheDataset?env.KAGGLE_CACHE_ID||'':''),numBatch:model?128:256,profileId:model?.profile_id||'personal-agent-q5-kv8-b256-96k',agentOnly:true,modelSpec:model,personalCacheSpec:personalCache?.spec||null}),language:'python',kernelType:'script',isPrivate:true,enableGpu:true,enableInternet:true,machineShape:'NvidiaTeslaT4',kernelExecutionType:'SAVE_AND_RUN_ALL',datasetDataSources:cacheDataset?[cacheDataset]:[],kernelDataSources:[],competitionDataSources:[],modelDataSources:[],categoryIds:[]};
     }catch{

@@ -43,17 +43,22 @@ export function validatePersonalSession(value,{now=Date.now(),requireFresh=true}
 async function launchFailure(response){
   let remote=null;const reader=response.body?.getReader();
   if(reader){try{let text='',size=0;const decoder=new TextDecoder();for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>8192)break;text+=decoder.decode(value,{stream:true});}if(size<=8192)remote=JSON.parse(text+decoder.decode())?.error;}catch{}finally{await reader.cancel().catch(()=>{});reader.releaseLock();}}
-  const allowed=new Set(['personal_launch_limit','personal_retry_cooldown','personal_session_active','personal_launch_unconfirmed','personal_launch_refused','personal_session_expired','personal_session_ended','personal_prepare_failed','personal_token_invalid','kaggle_refused','kaggle_rate_limit','kaggle_unknown','kaggle_not_found']);
+  const allowed=new Set(['personal_launch_limit','personal_retry_cooldown','personal_session_active','personal_launch_unconfirmed','personal_launch_refused','personal_session_expired','personal_session_ended','personal_prepare_failed','personal_token_invalid','kaggle_refused','kaggle_rate_limit','kaggle_unknown','kaggle_not_found','personal_notebook_inaccessible','personal_inventory_unconfirmed','personal_gpu_state_unconfirmed']);
   const code=allowed.has(remote?.code)?remote.code:response.status===429?'personal_launch_limit':response.status===409?'personal_session_active':response.status===401||response.status===403?'personal_token_invalid':'launch_unconfirmed';
   const origin=remote?.origin==='kaggle'?'kaggle':'connector';
-  const operation=['SaveKernel','GetKernelSessionStatus','IntrospectToken','PrepareKernel'].includes(remote?.operation)?remote.operation:null;
+  const operation=['SaveKernel','GetKernelSessionStatus','IntrospectToken','PrepareKernel','ListKernels','GetAcceleratorQuotaStatistics'].includes(remote?.operation)?remote.operation:null;
   const upstreamStatus=Number.isInteger(remote?.upstream_status)&&remote.upstream_status>=100&&remote.upstream_status<=599?remote.upstream_status:null;
   const upstreamCode=Number.isSafeInteger(remote?.upstream_code)?remote.upstream_code:['INVALID_ARGUMENT','RESOURCE_EXHAUSTED','PERMISSION_DENIED','UNAUTHENTICATED','NOT_FOUND','INTERNAL','UNAVAILABLE','DEADLINE_EXCEEDED'].includes(remote?.upstream_code)?remote.upstream_code:null;
   const category=['gpu_quota','dataset_access','account_verification','concurrent_notebooks','account_permission','request_rejected'].includes(remote?.category)?remote.category:null;
   const retryAfter=Number.isInteger(remote?.retry_after_seconds)&&remote.retry_after_seconds>0&&remote.retry_after_seconds<=86400?remote.retry_after_seconds:null;
   const launchUncertain=typeof remote?.launch_uncertain==='boolean'?remote.launch_uncertain:['personal_launch_refused','personal_session_expired','personal_session_ended','personal_prepare_failed','kaggle_not_found'].includes(code)?false:code==='kaggle_unknown'||code==='personal_launch_unconfirmed'||response.status>=500;
+  const notebookUrl=typeof remote?.notebook_url==='string'&&/^https:\/\/www\.kaggle\.com\/code\/[A-Za-z0-9_-]{1,64}\/qwen-agent-[a-f0-9]{24}$/.test(remote.notebook_url)?remote.notebook_url:null;
+  const canConfirmDeleted=code==='personal_notebook_inaccessible'&&remote?.can_confirm_deleted===true&&!!notebookUrl;
   let message;
-  if(code==='personal_launch_limit')message=`The connector safety ${remote?.limit_kind==='daily'?'daily launch limit':'launch cooldown'} was reached.${retryAfter?' Retry after '+retryAfter+' seconds.':''} Reuse the existing launch reference. Replacing your Kaggle token does not reset this limit.`;
+  if(code==='personal_notebook_inaccessible')message=`Kaggle cannot access an older coding notebook (HTTP ${upstreamStatus??403}). Open its notebook link and check your account. If you deleted the old coding notebooks and confirmed none are running or queued, select the deleted-notebook recovery checkbox, then check the same launch. No new notebook was submitted.`;
+  else if(code==='personal_inventory_unconfirmed')message='The full notebook inventory could not be verified. Old tracking was kept; no new GPU notebook was submitted. Check your Kaggle account access before retrying.';
+  else if(code==='personal_gpu_state_unconfirmed')message='Kaggle reports reserved GPU time or did not confirm its reservation state. Check running and queued notebooks before resetting old tracking. No new notebook was submitted.';
+  else if(code==='personal_launch_limit')message=`The connector safety ${remote?.limit_kind==='daily'?'daily launch limit':'launch cooldown'} was reached.${retryAfter?' Retry after '+retryAfter+' seconds.':''} Reuse the existing launch reference. Replacing your Kaggle token does not reset this limit.`;
   else if(code==='personal_retry_cooldown')message=`The connector is delaying repeated refused launches${retryAfter?' for '+retryAfter+' seconds':''}. The refused submission did not consume the daily GPU-launch allowance.`;
   else if(code==='personal_session_ended'||code==='personal_session_expired'||code==='personal_launch_refused'||code==='kaggle_not_found')message='The notebook for the previous launch reference has finished, was refused, or was confirmed absent. Retry to create a new launch reference after the short retry delay.';
   else if(origin==='kaggle'&&operation&&upstreamStatus)message=`Kaggle ${launchUncertain?'did not confirm':'refused'} ${operation} (HTTP ${upstreamStatus}${upstreamCode===null?'':'; provider code '+upstreamCode}${category?'; '+category:''}). ${category==='dataset_access'?'Check the attached private Dataset and its permissions.':category==='gpu_quota'?'Check your Kaggle GPU allowance.':category==='account_verification'?'Complete the required Kaggle account verification.':category==='concurrent_notebooks'?'Check running and queued Kaggle notebooks.':'Check your Kaggle account and notebook permissions.'} ${launchUncertain?'Retry the same launch reference to reconcile it; a second notebook will not be submitted.':'This is a Kaggle refusal, not the connector launch counter.'}`;
@@ -61,19 +66,20 @@ async function launchFailure(response){
   else if(code==='personal_token_invalid'||response.status===401||response.status===403)message='Your Kaggle token was not accepted. Forget the saved token, then paste a new token and retry. No owner account fallback was used.';
   else if(code==='personal_session_active')message='Your Kaggle account already has a coding notebook running or queued. Resume that session or stop it and wait for Kaggle to confirm it finished.';
   else message='The personal Kaggle launch could not be confirmed. Retry with the same launch reference to check the existing notebook; no owner connection fallback was used.';
-  return Object.assign(new Error(message),{status:response.status,code,origin,launchUncertain,...(operation?{operation}:{}),...(upstreamStatus?{upstreamStatus}:{}),...(upstreamCode===null?{}:{upstreamCode}),...(retryAfter?{retryAfter}:{} )});
+  return Object.assign(new Error(message),{status:response.status,code,origin,launchUncertain,...(operation?{operation}:{}),...(upstreamStatus?{upstreamStatus}:{}),...(upstreamCode===null?{}:{upstreamCode}),...(retryAfter?{retryAfter}:{}),...(notebookUrl?{notebookUrl,canConfirmDeleted}:{} )});
 }
 
-export async function createOwnKaggleSession({token,consent,modelUrl='',cacheId,clientId=randomUUID(),fetcher=fetch,now=Date.now()}){
+export async function createOwnKaggleSession({token,consent,modelUrl='',cacheId,clientId=randomUUID(),confirmDeletedNotebooks=false,fetcher=fetch,now=Date.now()}){
   if(consent!==true)throw new Error('Starting a personal GPU notebook requires your explicit consent.');
   if(typeof token!=='string'||!/^KGAT_[A-Za-z0-9_-]{16,251}$/.test(token.trim()))throw new Error('Enter your own modern Kaggle API token (KGAT_…).');
   if(!CLIENT_ID.test(clientId))throw new Error('Invalid launch reference.');
+  if(typeof confirmDeletedNotebooks!=='boolean')throw new Error('Deleted-notebook recovery requires an explicit choice.');
   const model=validateModelUrl(modelUrl);
   let response;
   try{
     response=await fetcher(RELAY_ORIGIN+'/v1/agent/sessions',{
       method:'POST',headers:{'content-type':'application/json'},credentials:'omit',redirect:'error',
-      body:JSON.stringify({kaggle_token:token.trim(),consent:true,client_id:clientId,...(cacheId?{cache_id:cacheId}:{}),...(model?{model_url:model}:{})}),signal:AbortSignal.timeout(90000),
+      body:JSON.stringify({kaggle_token:token.trim(),consent:true,client_id:clientId,...(confirmDeletedNotebooks?{confirm_deleted_notebooks:true}:{}),...(cacheId?{cache_id:cacheId}:{}),...(model?{model_url:model}:{})}),signal:AbortSignal.timeout(90000),
     });
   }catch{throw Object.assign(new Error('The personal Kaggle launch could not be confirmed. Retry with the same --launch-id to check that notebook. No owner connection fallback was used.'),{code:'launch_unconfirmed',launchUncertain:true,launchId:clientId});}
   if(!response.ok){

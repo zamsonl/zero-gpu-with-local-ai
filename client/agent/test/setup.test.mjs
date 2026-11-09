@@ -40,4 +40,71 @@ test('declined local installation gives a specific remedy without launching a no
 test('notebook launch and transport retry never become a local tools installation stage',async()=>{const boot=deferred(),end=deferred();let progress;const f=await fixture({launch:async(_args,deps)=>{progress=deps.onProgress;progress({stage:'launching',state:'running',detail:'Submitting your private Kaggle notebook.'});await boot.promise;return {done:end.promise,close:async()=>end.resolve({code:0})};}});try{f.controller.start({...choices});while(!progress)await new Promise(r=>setTimeout(r,1));assert.equal(f.controller.snapshot().phase,'launching');assert.equal(f.controller.snapshot().title,'Starting your Kaggle notebook');progress({stage:'installing',source:'notebook',state:'running',detail:'Preparing the saved runtime',connection:'retrying'});assert.equal(f.controller.snapshot().title,'Preparing the cloud runtime');assert.equal(f.controller.snapshot().detail,'Preparing the saved runtime');assert.equal(f.controller.snapshot().connection,'retrying');}finally{boot.resolve();end.resolve({code:0});await f.close();}});
 
 test('unchanged polled stages are not appended repeatedly to setup activity',async()=>{const f=await fixture();try{f.controller.start({...choices});await new Promise(r=>setTimeout(r,15));for(let i=0;i<100;i++)f.dependencies.onProgress({stage:'queued',source:'notebook',state:'running',detail:'Kaggle confirmed queued',elapsedSeconds:i});assert.equal(f.controller.snapshot().events.filter(e=>e.text==='Kaggle confirmed queued').length,1);}finally{await f.close();}});
+test('one setup failure reported by progress and its rejection appears once with its original stage',async()=>{
+  const message='Kaggle did not confirm GetKernelSessionStatus (HTTP 403).';
+  const f=await fixture({launch:async(_args,deps)=>{deps.onProgress({stage:'launching',state:'error',detail:message});throw Object.assign(new Error(message),{stage:'launching',code:'personal_launch_unconfirmed',launchUncertain:true});}});
+  try{f.controller.start({...choices});await f.controller.work;const state=f.controller.snapshot(),errors=state.events.filter(event=>event.text===message);assert.equal(errors.length,1);assert.equal(errors[0].level,'error');assert.equal(errors[0].stage,'launching');assert.equal(state.retrySameLaunch,true);assert.equal(state.phase,'error');}finally{await f.close();}
+});
+test('same activity text preserves changes in severity, stage and source',async()=>{
+  const f=await fixture();try{f.controller.start({...choices});await new Promise(resolve=>setTimeout(resolve,15));
+    const detail='Notebook status changed.';
+    for(const event of [{stage:'queued',state:'running'},{stage:'queued',state:'error'},{stage:'connecting',state:'error'},{stage:'connecting',state:'error',source:'notebook'}])f.dependencies.onProgress({...event,detail});
+    const events=f.controller.snapshot().events.filter(event=>event.text===detail);assert.equal(events.length,4);assert.deepEqual(events.map(({stage,level,source})=>({stage,level,source})),[{stage:'queued',level:'info',source:undefined},{stage:'queued',level:'error',source:undefined},{stage:'connecting',level:'error',source:undefined},{stage:'connecting',level:'error',source:'notebook'}]);
+  }finally{await f.close();}
+});
+test('a token remembered before launch failure is available to an explicit retry without another paste',async()=>{
+  let saved=false,calls=0;const f=await fixture({hasRememberedToken:async()=>saved,launch:async(_args,deps)=>{calls++;if(calls===1){assert.match(await deps.promptToken(),/^KGAT_/);saved=true;}else assert.equal(await deps.promptToken(),'');throw Object.assign(new Error('Notebook status remains unconfirmed.'),{launchUncertain:true});}});
+  try{f.controller.start({...choices,token:'KGAT_fixture_01234567890123456789'});await f.controller.work;assert.equal(f.controller.snapshot().rememberedToken,true);assert.equal(calls,1);f.controller.start({...choices});await f.controller.work;assert.equal(calls,2);assert.equal(f.controller.snapshot().rememberedToken,true);}finally{await f.close();}
+});
+test('deleted-notebook recovery requires its current safe error and a fresh explicit checkbox choice',async()=>{
+  const notebookUrl='https://www.kaggle.com/code/fixture/qwen-agent-'+'b'.repeat(24),attempts=[];
+  const f=await fixture({launch:async args=>{attempts.push(args);throw Object.assign(new Error('Kaggle could not verify the old notebook.'),{code:'personal_notebook_inaccessible',launchUncertain:true,canConfirmDeleted:true,notebookUrl});}});let reopened;
+  try{
+    assert.throws(()=>f.controller.start({...choices,confirmDeletedNotebooks:true}),error=>error.code==='recovery_not_available');
+    assert.throws(()=>f.controller.start({...choices,confirmDeletedNotebooks:'true'}),error=>error.code==='invalid_recovery_confirmation');
+    f.controller.start({...choices});await f.controller.work;assert.equal(f.controller.snapshot().error.canConfirmDeleted,true);assert.equal(f.controller.snapshot().error.notebookUrl,notebookUrl);assert.match(f.controller.snapshot().detail,/does not delete Kaggle files/);
+    f.controller.start({...choices});await f.controller.work;
+    f.controller.start({...choices,confirmDeletedNotebooks:true});await f.controller.work;
+    f.controller.start({...choices});await f.controller.work;
+    assert.deepEqual(attempts.map(args=>args.includes('--confirm-deleted-notebooks')),[false,false,true,false]);assert.equal(new Set(attempts.map(args=>args[args.indexOf('--launch-id')+1])).size,1);
+    const saved=await fs.readFile(path.join(f.directory,'prefs.json'),'utf8');assert(!saved.includes('confirmDeleted'));assert(!saved.includes(notebookUrl));
+    reopened=await createSetupController({preferenceFile:path.join(f.directory,'prefs.json'),hasRememberedToken:async()=>true});assert.equal(reopened.snapshot().error,null);assert.throws(()=>reopened.start({...choices,confirmDeletedNotebooks:true}),error=>error.code==='recovery_not_available');
+  }finally{await reopened?.close();await f.close();}
+});
+test('arbitrary recovery URLs and other error codes cannot authorize deletion confirmation',async()=>{
+  for(const patch of [{notebookUrl:'https://evil.invalid/code/fixture/qwen-agent-old'},{notebookUrl:'https://www.kaggle.com/code/fixture/qwen-agent-old?token=secret'},{code:'kaggle_unknown'}]){
+    const f=await fixture({launch:async()=>{throw Object.assign(new Error('Notebook lookup failed.'),{code:'personal_notebook_inaccessible',canConfirmDeleted:true,launchUncertain:true,notebookUrl:'https://www.kaggle.com/code/fixture/qwen-agent-old',...patch});}});
+    try{f.controller.start({...choices});await f.controller.work;assert.equal(f.controller.snapshot().error.canConfirmDeleted,undefined);assert.throws(()=>f.controller.start({...choices,confirmDeletedNotebooks:true}),error=>error.code==='recovery_not_available');}finally{await f.close();}
+  }
+});
 test('custom model links are Hugging Face GGUF only and invalid hosts never launch',async()=>{const f=await fixture();try{assert.throws(()=>f.controller.start({...choices,modelUrl:'https://ollama.com/library/qwen'}),/Hugging Face GGUF only/);assert.equal(f.calls,0);f.controller.start({...choices,modelUrl:'https://huggingface.co/example/model-GGUF'});await new Promise(r=>setTimeout(r,15));assert.equal(f.controller.snapshot().modelUrl,'https://huggingface.co/example/model-GGUF');}finally{await f.close();}});
+
+async function setupPage(initial){
+  class Element{
+    constructor(){this.value='';this.checked=false;this.disabled=false;this.hidden=false;this.children=[];this.dataset={};this.listeners={};this.scrollHeight=100;this.clientHeight=100;this.scrollTop=0;this.textContent='';}
+    addEventListener(name,handler){this.listeners[name]=handler;}setAttribute(){}removeAttribute(){}focus(){}append(...nodes){this.children.push(...nodes);}replaceChildren(...nodes){this.children=nodes;}querySelector(){return null;}
+  }
+  const elements=new Map(),posts=[];const element=id=>{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);};
+  element('confirm-deleted-notebooks').checked=true; // Browsers can restore form controls on reload.
+  const source=await fs.readFile(new URL('../setup-public/setup.js',import.meta.url),'utf8');
+  const html=await fs.readFile(new URL('../setup-public/index.html',import.meta.url),'utf8');
+  const recoveryInput=/<input\b[^>]*id="confirm-deleted-notebooks"[^>]*>/.exec(html)?.[0];assert(recoveryInput);assert(!/\bchecked\b/.test(recoveryInput));
+  const response=value=>({ok:true,json:async()=>value});
+  const fetcher=async(url,options)=>{if(url==='/api/state')return response(initial);if(url==='/api/ping')return response({ok:true});if(url==='/api/events')return new Promise(()=>{});if(url==='/api/start'){posts.push(JSON.parse(options.body));return response(initial);}throw new Error('Unexpected local UI route '+url);};
+  const document={getElementById:element,createElement:()=>new Element(),createElementNS:()=>new Element(),createDocumentFragment:()=>new Element(),querySelector:()=>null,addEventListener(){},hidden:true,body:{dataset:{}}};
+  const execute=new(Object.getPrototypeOf(async function(){}).constructor)('document','location','sessionStorage','history','fetch','setInterval','setTimeout','clearTimeout','window','navigator','matchMedia',source+'\nreturn {render};');
+  const controls=await execute(document,{hash:'#'+'a'.repeat(64),pathname:'/',search:''},{getItem:()=>null,setItem(){}},{replaceState(){}},fetcher,()=>0,()=>0,()=>{},{addEventListener(){}},{sendBeacon(){}},()=>({matches:false}));
+  element('gpu-consent').checked=true;
+  return {element,posts,controls,submit:()=>element('setup-form').listeners.submit({preventDefault(){}})};
+}
+test('recovery checkbox appears only for its safe error and never authorizes a later retry automatically',async()=>{
+  const error={code:'personal_notebook_inaccessible',message:'Check your old notebook.',canConfirmDeleted:true,notebookUrl:'https://www.kaggle.com/code/fixture/qwen-agent-'+'c'.repeat(24)};
+  const initial={phase:'error',folder:choices.folder,rememberedToken:true,canRetry:true,retrySameLaunch:true,error,events:[]};
+  const ui=await setupPage(initial);assert.equal(ui.element('deleted-notebook-recovery').hidden,false);assert.equal(ui.element('confirm-deleted-notebooks').checked,false);assert.equal(ui.element('deleted-notebook-link').href,error.notebookUrl);
+  await ui.submit();assert.equal(ui.posts[0].confirmDeletedNotebooks,undefined);
+  ui.element('confirm-deleted-notebooks').checked=true;await ui.submit();assert.equal(ui.posts[1].confirmDeletedNotebooks,true);assert.equal(ui.element('confirm-deleted-notebooks').checked,false);
+  await ui.submit();assert.equal(ui.posts[2].confirmDeletedNotebooks,undefined);
+  ui.controls.render({...initial,error:null});assert.equal(ui.element('deleted-notebook-recovery').hidden,true);
+  ui.controls.render({...initial,error:{...error,notebookUrl:'https://evil.invalid/notebook'}});assert.equal(ui.element('deleted-notebook-recovery').hidden,true);assert.equal(ui.element('confirm-deleted-notebooks').checked,false);
+  const reopened=await setupPage(initial);assert.equal(reopened.element('confirm-deleted-notebooks').checked,false);
+});

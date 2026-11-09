@@ -5,6 +5,7 @@ const terminalPhases=new Set(['idle','stopped','error']);
 let state={phase:'idle',title:'Ready when you are',detail:'Choose your project and connect your Kaggle account.',events:[],rememberedToken:false,secureStorageAvailable:true,canRetry:true};
 let actionError='',initialized=false,folderEdited=false,tokenChanged=false,submitting=false,eventSignature='',eventStream=null,reconnectTimer=null,reconnectAttempt=0,streamStopped=false,serverStartedAt=null,activityTouched=false,wasActive=false;
 const storageKey='heretic-qwen-setup-capability';
+$('confirm-deleted-notebooks').checked=false;
 const fragment=location.hash.slice(1),params=new URLSearchParams(fragment);
 let capability=params.get('cap')||params.get('capability')||params.get('token')||fragment;
 if(!/^[A-Za-z0-9_-]{32,200}$/.test(capability||'')){try{capability=sessionStorage.getItem(storageKey)||'';}catch{capability='';}}
@@ -78,6 +79,11 @@ function render(next){
   if(state.secureStorageAvailable===false)$('remember-token').checked=false;
   if(state.error){const message=typeof state.error==='string'?state.error:state.error.message;setError($('form-error'),message||'Setup could not finish. Check the activity log.');}
   else if(actionError)setError($('form-error'),actionError);else if(phase!=='error')setError($('form-error'),'');
+  const recoveryUrl=state.error?.code==='personal_notebook_inaccessible'&&state.error.canConfirmDeleted===true?validRecoveryNotebook(state.error.notebookUrl):null;
+  $('deleted-notebook-recovery').hidden=!recoveryUrl||isBusy||running;
+  $('confirm-deleted-notebooks').disabled=!recoveryUrl||isBusy||running;
+  if(!recoveryUrl||isBusy||running)$('confirm-deleted-notebooks').checked=false;
+  if(recoveryUrl)$('deleted-notebook-link').href=recoveryUrl;
   const notebook=validNotebook(state.notebookUrl||state.url),hasIdentity=!!(notebook||state.owner);
   $('runtime-links').hidden=!hasIdentity;$('account-name').textContent=state.owner||'—';$('notebook-link').hidden=!notebook;if(notebook)$('notebook-link').href=notebook;
   const journey=['tools','cache','notebook','runtime','model','terminal'];
@@ -99,6 +105,7 @@ function render(next){
   $('local-connection').textContent=state.connection==='retrying'?'Local setup connected · retrying the notebook connection':state.connection==='queue_unavailable'?'Kaggle status check unavailable · startup logs remain visible':'Connected to local setup';
 }
 function validNotebook(value){try{const url=new URL(value);return url.protocol==='https:'&&url.hostname==='www.kaggle.com'&&url.pathname.startsWith('/code/')?url.href:null;}catch{return null;}}
+function validRecoveryNotebook(value){try{const url=new URL(value);return url.origin==='https://www.kaggle.com'&&!url.username&&!url.password&&!url.search&&!url.hash&&/^\/code\/[A-Za-z0-9_-]{1,64}\/qwen-agent-[A-Za-z0-9_-]{1,160}\/?$/.test(url.pathname)?url.href:null;}catch{return null;}}
 
 async function refresh(){const next=await api('/api/state');render(next);return next;}
 function applyActionState(value){if(value?.phase||value?.state)render(value);}
@@ -138,7 +145,9 @@ $('setup-form').addEventListener('submit',async event=>{
   if(!folder){setError($('folder-error'),'Choose the project folder you want Qwen to work in.');$('folder').setAttribute('aria-invalid','true');$('folder').focus();return;}
   if((!state.rememberedToken||tokenChanged)&&!/^KGAT_[A-Za-z0-9_-]{16,251}$/.test(token)){setError($('token-error'),'Paste the complete modern API token beginning with KGAT_.');$('token').setAttribute('aria-invalid','true');$('token').focus();return;}
   if(!$('gpu-consent').checked){setError($('form-error'),'Confirm using your own Kaggle GPU allowance before starting.');$('gpu-consent').focus();return;}
-  const payload={folder,modelUrl,token:(!state.rememberedToken||tokenChanged)?token:'',rememberToken:state.rememberedToken&&!tokenChanged?true:$('remember-token').checked&&state.secureStorageAvailable!==false,browser:$('browser').checked,installConsent:$('install-consent').checked,gpuConsent:true};
+  const confirmDeletedNotebooks=!$('deleted-notebook-recovery').hidden&&$('confirm-deleted-notebooks').checked;
+  const payload={folder,modelUrl,token:(!state.rememberedToken||tokenChanged)?token:'',rememberToken:state.rememberedToken&&!tokenChanged?true:$('remember-token').checked&&state.secureStorageAvailable!==false,browser:$('browser').checked,installConsent:$('install-consent').checked,gpuConsent:true,...(confirmDeletedNotebooks?{confirmDeletedNotebooks:true}:{})};
+  $('confirm-deleted-notebooks').checked=false;
   submitting=true;serverStartedAt=Date.now();render(state);
   try{const result=await api('/api/start',payload,{timeout:30000});$('token').value='';payload.token='';applyActionState(result);if(!result?.phase&&!result?.state)await refresh();}
   catch(error){payload.token='';$('token').value='';actionError=messageOf(error);setError($('form-error'),actionError);try{await refresh();}catch{};}

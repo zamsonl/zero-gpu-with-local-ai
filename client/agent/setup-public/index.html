@@ -55,6 +55,10 @@
               <label class="check-row"><input id="install-consent" type="checkbox"><span>Allow installing missing local tools<span class="help">OpenCode and browser tools. Installed tools are reused.</span></span></label>
               <label class="check-row"><input id="gpu-consent" type="checkbox" required><span>Prepare my private cache and use my Kaggle GPUs<span class="help">First use saves model/runtime files in your private Dataset using CPU only. GPU startup and time online use your GPU allowance.</span></span></label>
               <p id="form-error" class="field-error form-error" role="alert" hidden></p>
+              <div id="deleted-notebook-recovery" hidden>
+                <p class="help">Kaggle could not verify your old coding notebook. <a id="deleted-notebook-link" href="https://www.kaggle.com/code" target="_blank" rel="noopener noreferrer">Check the old notebook</a> and your running or queued notebooks first.</p>
+                <label class="check-row remember-row"><input id="confirm-deleted-notebooks" type="checkbox"><span>I deleted my old coding notebooks and checked that none of them are running or queued.<span class="help">This resets only stale unlaunched tracking after Kaggle checks. It does not delete Kaggle files.</span></span></label>
+              </div>
               <div class="launch-actions"><button id="start" class="primary-button" type="submit">Start Qwen <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg></button><p id="start-help" class="action-help">OpenCode opens when your model is ready.</p></div>
             </section>
           </fieldset>
