@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <title>Heretic Qwen</title>
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f8f8f8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111111" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="stylesheet" href="/vendor/hljs-github.min.css" id="hljs-light" media="(prefers-color-scheme: light)">
+  <link rel="stylesheet" href="/vendor/hljs-github-dark.min.css" id="hljs-dark" media="(prefers-color-scheme: dark)">
+  <link rel="preload" href="/vendor/fonts/inter-latin-opsz-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/vendor/fonts/jetbrains-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/ledger.css">
+  <script src="/boot.js"></script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#prompt">Skip to message</a>
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar" aria-label="Chats">
+      <div class="sidebar-head">
+        <a class="brand" href="/" id="brand">
+          <img class="brand-mark" src="/icon-mark.png" alt="" width="24" height="24">
+          <span class="brand-name">Heretic Qwen</span>
+        </a>
+        <button class="icon-button" type="button" id="sidebar-close" aria-label="Hide chats" title="Hide chats"></button>
+      </div>
+      <div class="sidebar-scope"><span>Cloud workspace</span><span class="brand-badge" id="brand-badge" title="The model the server runs" hidden></span></div>
+      <button class="new-chat" type="button" id="new-chat" title="New chat (Ctrl+Shift+O)">
+        <span class="new-chat-label">New conversation</span>
+        <kbd class="shortcut" data-keys="mod+shift+o"></kbd>
+      </button>
+      <div class="search" role="search">
+        <input class="search-input" type="search" id="search" placeholder="Search conversations" aria-label="Search chats" autocomplete="off" spellcheck="false">
+        <kbd class="shortcut" data-keys="mod+k"></kbd>
+      </div>
+      <button class="nav-item" type="button" id="nav-images" title="Make pictures with Qwen-Image 2.1">
+        <span class="nav-label">Images</span>
+        <span class="nav-count" id="nav-images-count" hidden></span>
+      </button>
+      <button class="nav-item" type="button" id="nav-documents" title="Documents in this chat"><svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2h7l4 4v12H5zM12 2v5h4M8 10h5M8 13h5"/></svg><span class="nav-label">Documents</span></button>
+      <a class="nav-item" href="/agent/" title="Read and edit a selected PC folder with approved terminal commands"><svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m7 5-5 5 5 5m6-10 5 5-5 5m-2-13L9 18"/></svg><span class="nav-label">Local coding agent</span><span class="nav-external" aria-hidden="true">↗</span></a>
+      <p class="history-label">Conversations</p>
+      <nav class="chat-list" id="chat-list" aria-label="Chat history"></nav>
+      <div class="meters" id="meters" aria-label="Server usage" hidden></div>
+      <div class="sidebar-foot">
+        <p class="workspace-note">Your cloud Qwen workspace</p>
+        <div class="theme-switch" id="theme-switch" role="radiogroup" aria-label="Theme"></div>
+        <button class="settings-button" type="button" id="settings-open" title="Settings (Ctrl+,)">
+          <span class="button-label">Settings</span>
+        </button>
+      </div>
+    </aside>
+    <div class="backdrop" id="backdrop" hidden></div>
+
+    <main class="main" id="main">
+      <header class="topbar">
+        <button class="icon-button" type="button" id="sidebar-open" aria-label="Show chats" aria-controls="sidebar" aria-expanded="false" title="Show chats"></button>
+        <button class="icon-button topbar-new" type="button" id="topbar-new" aria-label="New chat" title="New chat (Ctrl+Shift+O)"></button>
+        <div class="chat-heading">
+          <h1 class="chat-title" id="chat-title">New chat</h1>
+          <div class="chat-subtitle"><span id="active-model-size">Qwen 27B</span><span aria-hidden="true">·</span><span class="chat-count" id="chat-count" hidden></span><span class="chat-subtitle-default">Cloud conversation</span></div>
+        </div>
+        <button class="session-toggle" type="button" id="session-toggle" aria-controls="session-rail" aria-expanded="false"><svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h12v12H4zM12 4v12"/></svg><span>Session</span></button>
+        <button class="icon-button" type="button" id="chat-menu" aria-label="Chat options" aria-haspopup="menu" title="Chat options" hidden></button>
+      </header>
+
+      <section class="conversation" id="conversation" aria-label="Messages">
+        <div class="thread" id="thread"></div>
+      </section>
+
+      <section class="images-view" id="images-view" aria-label="Images" hidden></section>
+
+      <div class="dock" id="dock">
+        <button class="jump" type="button" id="jump" hidden>Jump to latest</button>
+        <section class="banner" id="banner" aria-labelledby="banner-title" hidden></section>
+        <div class="notice" id="notice" role="alert" hidden></div>
+        <div class="mode-note" id="mode-note" role="status" hidden></div>
+        <form class="composer" id="composer" autocomplete="off">
+          <div class="attachments" id="attachments" aria-label="Attached files" hidden></div>
+          <label class="sr-only" for="prompt">Message</label>
+          <textarea class="prompt" id="prompt" rows="1" placeholder="Message Heretic Qwen" enterkeyhint="enter"></textarea>
+          <input class="sr-only" type="file" id="file-picker" multiple tabindex="-1" aria-hidden="true">
+          <div class="composer-bar">
+            <button class="attach" type="button" id="attach" aria-label="Attach files" title="Attach files (text, code, logs, PDFs)"><span class="attach-label" aria-hidden="true">Attach</span></button>
+            <button class="think-toggle" type="button" id="think" aria-pressed="true" title="Let the model reason before it answers">
+              <span class="think-label">Think</span>
+            </button>
+            <p class="composer-hint" id="composer-hint" hidden></p>
+            <span class="counter" id="counter" aria-live="polite" hidden></span>
+            <span class="keys" id="keys" aria-hidden="true"></span>
+            <button class="answer-now" type="button" id="answer-now" hidden title="Save the current work and finish without more thinking">Answer now</button>
+            <button class="send" type="submit" id="send" aria-label="Send" title="Send (Enter)"></button>
+          </div>
+        </form>
+      </div>
+
+      <aside class="session-rail" id="session-rail" aria-label="Current session">
+        <div class="session-rail-head"><h2>Current session</h2><button class="icon-button" id="session-close" type="button" aria-label="Close session details"><svg class="icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button></div>
+        <div class="server" id="server">
+          <button class="status-pill" type="button" id="status-pill" aria-haspopup="dialog" aria-expanded="false" data-tone="neutral">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="status-label" id="status-label">Checking</span>
+            <span class="status-detail" id="status-detail"></span>
+          </button>
+          <div class="gauge gauge-memory" id="gauge-memory" title="Estimated context for the next input" hidden>
+            <span class="gauge-name">Input</span>
+            <span class="gauge-track" aria-hidden="true"><span class="gauge-fill"></span></span>
+            <span class="gauge-value"></span>
+          </div>
+          <div class="gauge gauge-speed" id="gauge-speed" title="Reply speed in this chat" hidden>
+            <span class="gauge-name">Speed</span>
+            <svg class="sparkline" viewBox="0 0 48 16" aria-hidden="true"><polyline points=""/></svg>
+            <span class="gauge-value"></span>
+          </div>
+          <a class="colab-link" id="colab-link" href="https://colab.research.google.com/" target="_blank" rel="noopener noreferrer"><span class="colab-label">Open Colab</span></a>
+        </div>
+        <div id="session-content"></div>
+      </aside>
+    </main>
+  </div>
+  <button class="session-backdrop" id="session-backdrop" type="button" aria-label="Close session details" hidden></button>
+  <div class="drop-zone" id="drop-zone" aria-hidden="true" hidden>
+    <div class="drop-zone-card">
+      <span class="drop-zone-title">Drop files to attach</span>
+      <span class="drop-zone-text">Text, code, logs, data or PDFs</span>
+    </div>
+  </div>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  <div class="sr-only" id="announcer" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,42 @@
+name = "your-qwen-relay"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["enable_request_signal"]
+workers_dev = true
+
+[[rules]]
+type = "Text"
+globs = ["**/*.py"]
+fallthrough = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "qwen-chats"
+database_id = "00000000-0000-0000-0000-000000000000" # Replace with YOUR D1 database ID before deploying.
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "qwen-images"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+
+[vars]
+MODEL = "qwen3.8-hauhau"
+MODEL_LABEL = "Heretic Qwen"
+NUM_CTX = "24576"
+HISTORY_CHARS = "42000"
+COLAB_URL = "https://colab.research.google.com/"
+AUTH_MODE = "key"
+KAGGLE_CACHE_DATASET = ""
+KAGGLE_CACHE_ID = ""
+KAGGLE_NUM_BATCH = "256"
+KAGGLE_CONTEXT_MAX = "98304"
+# Optional measured CPU limit: configure only if supported by your Workers plan.
+# [limits]
+# cpu_ms = 60000
+# Set secrets with Wrangler; never put values here.

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Local agent setup · Heretic Qwen</title>
+  <link rel="icon" href="/mark.png">
+  <link rel="stylesheet" href="/setup.css">
+  <script type="module" src="/setup.js"></script>
+</head>
+<body data-phase="idle">
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand"><img src="/mark.png" alt="" width="28" height="28"><span>Heretic Qwen</span><span class="brand-divider" aria-hidden="true"></span><span class="scope">Local agent</span></div>
+      <span class="local-scope"><span class="local-dot" aria-hidden="true"></span>On this computer</span>
+    </header>
+
+    <main>
+      <div class="page-heading">
+        <h1>Set up your local agent</h1>
+        <p>Connect your project to Qwen, then open it in OpenCode.</p>
+      </div>
+      <div id="connection-notice" class="connection-notice" role="status" hidden><span id="connection-message"></span><button id="reconnect" class="text-button" type="button" hidden>Reconnect</button></div>
+      <div id="access-error" class="access-error" role="alert" hidden><h2>Open setup from your launcher</h2><p>This setup window has no local connection. Close it and double-click <strong>Start Qwen OpenCode.cmd</strong>.</p></div>
+
+      <div class="workspace" id="workspace">
+        <form id="setup-form" class="setup-panel" novalidate>
+          <fieldset id="setup-fields">
+            <section class="form-section" aria-labelledby="project-heading">
+              <div class="section-heading"><h2 id="project-heading">Project</h2><span class="section-note">Your working folder</span></div>
+              <label for="folder">Project folder</label>
+              <div class="folder-field"><input id="folder" name="folder" type="text" placeholder="Choose a folder or paste its path" autocomplete="off" spellcheck="false" required aria-describedby="folder-help folder-error"><button id="browse" class="secondary-button" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5a1 1 0 0 1 1-1h4l2 2h7a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1z"/></svg>Choose folder</button></div>
+              <p id="folder-help" class="help">Edits and terminal commands will still ask for your approval.</p>
+              <p id="folder-error" class="field-error" role="alert" hidden></p>
+              <details class="model-options" id="model-options"><summary id="model-summary">Model · Default Qwen 27B</summary><label for="model-url">Custom model link <span class="help">Hugging Face GGUF only</span></label><input id="model-url" type="text" inputmode="url" placeholder="https://huggingface.co/owner/model-GGUF" autocomplete="off" spellcheck="false" aria-describedby="model-help model-error"><p id="model-help" class="help">Leave empty to use the default Qwen. Public Hugging Face repositories or complete .gguf file links only. The model must support Ollama chat and tool calling. Private/gated models, split shards and other model hosts are not supported.</p><p id="model-error" class="field-error" role="alert" hidden></p></details>
+            </section>
+
+            <section class="form-section" aria-labelledby="connection-heading">
+              <div class="section-heading"><h2 id="connection-heading">Kaggle connection</h2><button id="open-kaggle" class="text-button" type="button">Get API token <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5h7v7M12.2 3.8 4 12"/></svg></button></div>
+              <div id="saved-token" class="saved-token" hidden><div class="saved-token-copy"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 9V6a4 4 0 0 1 8 0v3M5 9h10v8H5z"/></svg><div><strong>Encrypted token saved</strong><p>Ready to use on this Windows account.</p></div></div><button id="change-token" class="text-button" type="button">Change</button></div>
+              <div id="token-entry">
+                <label for="token">Kaggle API token</label>
+                <div class="token-field"><input id="token" name="token" type="password" placeholder="Paste your KGAT_ token" autocomplete="off" spellcheck="false" aria-describedby="token-help token-error"><button id="reveal-token" class="icon-button" type="button" aria-label="Show token" title="Show token"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10s3-5 8-5 8 5 8 5-3 5-8 5-8-5-8-5z"/><circle cx="10" cy="10" r="2"/></svg></button></div>
+                <p id="token-help" class="help">Used to start your own private notebook. Never sent to the model.</p>
+                <p id="token-error" class="field-error" role="alert" hidden></p>
+                <label class="check-row remember-row"><input id="remember-token" type="checkbox" checked><span>Remember securely on this computer<span class="help">Protected with your Windows account encryption.</span></span></label>
+              </div>
+              <div class="browser-row"><div><label for="browser">Browser &amp; web search</label><p class="help">Isolated Playwright tools, using your model.</p></div><input id="browser" class="switch" type="checkbox" role="switch" checked></div>
+              <div id="saved-token-actions" class="token-actions" hidden><button id="forget-token" class="text-button subtle-button" type="button">Forget saved token</button></div>
+            </section>
+
+            <section class="form-section launch-section" aria-labelledby="launch-heading">
+              <div class="section-heading"><h2 id="launch-heading">Launch</h2><span class="section-note" id="launch-model">Qwen 27B · your account</span></div>
+              <label class="check-row"><input id="install-consent" type="checkbox"><span>Allow installing missing local tools<span class="help">OpenCode and browser tools. Installed tools are reused.</span></span></label>
+              <label class="check-row"><input id="gpu-consent" type="checkbox" required><span>Prepare my private cache and use my Kaggle GPUs<span class="help">First use saves model/runtime files in your private Dataset using CPU only. GPU startup and time online use your GPU allowance.</span></span></label>
+              <p id="form-error" class="field-error form-error" role="alert" hidden></p>
+              <div class="launch-actions"><button id="start" class="primary-button" type="submit">Start Qwen <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg></button><p id="start-help" class="action-help">OpenCode opens when your model is ready.</p></div>
+            </section>
+          </fieldset>
+
+        </form>
+
+        <aside class="status-panel" aria-labelledby="status-heading">
+          <div class="status-topline"><span id="status-label" class="status-label">Not started</span><span id="elapsed" class="elapsed" aria-label="Elapsed setup time"></span></div>
+          <div class="status-copy" role="status" aria-live="polite" aria-atomic="true"><h2 id="status-heading">Ready when you are</h2><p id="status-detail">Choose your project and connect your Kaggle account.</p></div>
+          <ol class="startup-journey" aria-label="Startup stages">
+            <li data-step="tools"><span>Check local tools</span><small>Pending</small></li>
+            <li data-step="cache"><span>Prepare private model cache</span><small>Pending</small></li>
+            <li data-step="notebook"><span>Start your Kaggle notebook</span><small>Pending</small></li>
+            <li data-step="runtime"><span>Prepare cloud runtime</span><small>Pending</small></li>
+            <li data-step="model"><span>Load Qwen 27B</span><small>Pending</small></li>
+            <li data-step="terminal"><span>Open OpenCode</span><small>Pending</small></li>
+          </ol>
+          <div id="busy-mark" class="busy-mark" aria-hidden="true" hidden><span></span></div>
+          <div id="runtime-links" class="runtime-links" hidden><div class="account-line"><span>Your Kaggle account</span><strong id="account-name"></strong></div><a id="notebook-link" class="secondary-button" href="https://www.kaggle.com/code" target="_blank" rel="noopener noreferrer">Open notebook <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5h7v7M12.2 3.8 4 12"/></svg></a></div>
+          <div id="stop-actions" class="stop-actions" hidden><button id="cancel" class="secondary-button" type="button">Cancel setup</button><p id="close-help" class="help">Keep this setup window open while you use Qwen.</p></div>
+          <details class="activity" id="activity" open><summary><span>Setup activity</span><span id="event-count" class="event-count"></span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5 6 3 3 3-3"/></svg></summary><div class="activity-body"><p id="empty-activity" class="empty-activity">Actual setup updates will appear here.</p><ol id="events" class="event-list" aria-label="Setup activity"></ol><button id="latest" class="text-button jump-latest" type="button" hidden>Jump to latest</button></div></details>
+          <details class="setup-help" id="troubleshooting"><summary>Troubleshooting &amp; faster startup</summary><p><strong>Launch limit reached?</strong> Check your active Kaggle notebooks first. To replace a stale token or use a different account, choose <strong>Forget saved token</strong>, enter the new token, then retry. Replacing a token for the same account does not reset its four-minute cooldown, daily launch limit or GPU quota.</p><button id="troubleshoot-forget" class="text-button" type="button">Forget saved token</button><p><a href="https://www.kaggle.com/code?tab=your-work" target="_blank" rel="noopener noreferrer">Check your Kaggle notebooks ↗</a></p><p><strong>Waiting for GPUs?</strong> The queue belongs to Kaggle. We check its reported status and keep a single session; repeated starts can make limits worse. Cancel setup before changing accounts.</p><p><strong>Can files on my PC speed this up?</strong> A cloud GPU cannot read a local model folder directly. Uploading the same weights each time is usually slower. A compatible private Kaggle dataset cache can skip downloads after GPUs are assigned; it cannot shorten the queue. Setup creates a private model/runtime Dataset in your own account using one reusable CPU builder. Default Qwen and supported custom Hugging Face GGUFs each keep their own pinned cache. Later launches reuse ready caches. The first build takes longer and needs enough private Dataset storage.</p></details>
+          <div class="runtime-facts"><div><span>Model</span><strong id="selected-model-name">Qwen 27B</strong></div><div><span>Context window</span><strong id="selected-context">98,304 tokens</strong></div><p>Your model runs on Kaggle. Project tools run on this computer.</p></div>
+        </aside>
+      </div>
+    </main>
+    <footer><span>Only your selected hosted model. Your saved chats stay on this computer.</span><span id="local-connection">Connecting to local setup…</span></footer>
+  </div>
+
+  <dialog id="forget-dialog"><form method="dialog"><h2>Forget your saved token?</h2><p>This removes the encrypted copy from this computer. Your Kaggle token and saved conversations stay available.</p><div class="dialog-actions"><button class="secondary-button" value="cancel">Keep token</button><button class="primary-button" value="forget">Forget token</button></div></form></dialog>
+</body>
+</html>

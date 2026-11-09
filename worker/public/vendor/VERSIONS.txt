@@ -1,0 +1,28 @@
+Vendored browser builds for the web UI. No CDN is used at runtime; these files are served from /vendor/.
+Installed with npm into a temporary folder outside the repo (npm install --ignore-scripts), copied
+byte for byte (only renamed where noted), then the temporary folder was deleted. Installed 2026-10-14.
+
+Packages (npm tarball integrity):
+  marked@18.0.14                 MIT                     sha512-mBHK6FBHuBAlhgRe88w9F0O1AbwwXJUcQibUbC/QcdTbVGAD7aWza+xt3N6oT/jCZx3/OMeS+8rnuiHZcQ9s7A==
+  dompurify@3.4.16               MPL-2.0 OR Apache-2.0   sha512-sqo+pNp3qRhCIpbgRi1y8Tgk27Bo2Ry7w0dC1NBeNTdZChWjz9Xb/KOoZbRP/R6pQZ80Qw8YhXw13hWWBbMRnQ==
+  @highlightjs/cdn-assets@11.12.0  BSD-3-Clause          sha512-KvOKXODaiFmId9xaq3xc5xCL66wVLUuOngDbO9B/kewbFTqdGbn2nJxNhN3H5R1cgDTVj6R8vH0zgiNDEGjpDw==
+
+Files:
+file                       package@version                    source path in the package                    sha256
+marked.esm.js              marked@18.0.14                     lib/marked.esm.js                             528a1b88bef88fc27277e06036ce7f4afb6a220b18110ba57c09e292b24a7ce0
+purify.es.js               dompurify@3.4.16                   dist/purify.es.mjs (renamed .js)              c44274a7959cfdd4da871fa78a5d5fbbef55db68d118c5c0833bc4b5cf9633ad
+highlight.min.js           @highlightjs/cdn-assets@11.12.0    es/highlight.min.js                           1ed8fc5256b738b8875b74e4d3f0754f60d6411fb034d618dfbc4e6e6c9999d7
+hljs-powershell.min.js     @highlightjs/cdn-assets@11.12.0    es/languages/powershell.min.js                67c95a71dae92f010a15e959158aaf682cd850a008d466f1c5d40394cbe22f12
+hljs-dockerfile.min.js     @highlightjs/cdn-assets@11.12.0    es/languages/dockerfile.min.js                5a83ccd455a2910e9018f591fc1d2856ff5151ffa9889fc000542e16b329b039
+hljs-github.min.css        @highlightjs/cdn-assets@11.12.0    styles/github.min.css                         3a9a5def8b9c311e5ae43abde85c63133185eed4f0d9f67fea4b00a8308cf066
+hljs-github-dark.min.css   @highlightjs/cdn-assets@11.12.0    styles/github-dark.min.css                    9f208d022102b1d0c7aebfecd8e42ca7997d5de636649d2b31ea63093d809019
+
+Fonts (SIL Open Font License 1.1, latin subset, served from /vendor/fonts/; installed 2026-10-14):
+fonts/charis-sil-latin-400-normal.woff2      @fontsource/charis-sil@5.3.0           files/charis-sil-latin-400-normal.woff2  1bbdc8d4124dc3d8d4bda1c057dea874ceb1298d499b3747c44279c8f288db96
+fonts/charis-sil-latin-400-italic.woff2      @fontsource/charis-sil@5.3.0           files/charis-sil-latin-400-italic.woff2  03a2701106f9e0054808d2617cc3b1404a9b1fa69f14130d654e26f412f244be
+fonts/charis-sil-latin-700-normal.woff2      @fontsource/charis-sil@5.3.0           files/charis-sil-latin-700-normal.woff2  559166334cfb2548920c55c1922e601c17a4bb34160afac03a4f69fbc6e42279
+fonts/charis-sil-latin-700-italic.woff2      @fontsource/charis-sil@5.3.0           files/charis-sil-latin-700-italic.woff2  61e9de4018a1a2535f4862d3fecbc54ae8d8a8f3d905de7e94a245405ac8ac26
+
+pdf.js (Apache-2.0), loaded only when a PDF is attached; installed 2026-10-16:
+pdfjs/pdf.min.mjs                      pdfjs-dist@4.10.38    build/pdf.min.mjs  27fc2a057a00f92a4334ad06e17dbd7259912954e9fb7f76400bcca5fd190a9c
+pdfjs/pdf.worker.min.mjs               pdfjs-dist@4.10.38    build/pdf.worker.min.mjs  1baa1844c89c80a5b2797c916e75ab29254be46d8e9cb53cb6364d7aad84be36
