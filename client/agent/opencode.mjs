@@ -84,7 +84,7 @@ export function emitSetupProgress(observer,event,secrets=[]){
   const value={stage:PROGRESS_STAGES.has(event.stage)?event.stage:'checking',state:['pending','running','complete','error'].includes(event.state)?event.state:'running',detail:sanitizeSetupText(event.detail,secrets)};
   for(const name of ['line','item','folder'])if(typeof event[name]==='string')value[name]=sanitizeSetupText(event[name],secrets,{maxLength:name==='folder'?4096:800});
   if(event.source==='notebook'||event.source==='installer')value.source=event.source;
-  if(['connected','retrying','stale'].includes(event.connection))value.connection=event.connection;
+  if(['connected','retrying','stale','queue_unavailable'].includes(event.connection))value.connection=event.connection;
   if(Number.isFinite(event.elapsedSeconds)&&event.elapsedSeconds>=0)value.elapsedSeconds=Math.floor(event.elapsedSeconds);
   if(Number.isFinite(event.percent)&&event.percent>=0&&event.percent<=100)value.percent=event.percent;
   if(typeof event.owner==='string'&&/^[A-Za-z0-9_-]{1,80}$/.test(event.owner))value.owner=event.owner;
@@ -292,7 +292,7 @@ function pauseUntilPoll(ms,signal){
 }
 
 export async function waitForOwnReady(session,{signal,log=console.log,onProgress,probeNotebook,onReady,request=ownCloudRequest,pause=pauseUntilPoll,now=Date.now,timeoutMs=OPEN_CODE_REQUEST_TIMEOUT_MS,pollMs=5000}={}){
-  const start=now(),secrets=[session?.key];let reported='',lastReport=0,lastBootAt=-Infinity,lastLogPoll=-Infinity,lastQueueProbe=-Infinity,queueResult=null;
+  const start=now(),secrets=[session?.key];let reported='',lastReport=0,lastBootAt=-Infinity,lastLogPoll=-Infinity,lastQueueProbe=-Infinity,queueResult=null,queueDiagnostic='';
   let current={stage:'connecting',detail:'Waiting for the notebook to report its startup stage.'};const seenLines=new Set();
   const elapsed=()=>Math.floor(Math.max(0,now()-start)/1000);
   const publish=event=>emitSetupProgress(onProgress,{source:'notebook',...event,elapsedSeconds:elapsed()},secrets);
@@ -329,7 +329,20 @@ export async function waitForOwnReady(session,{signal,log=console.log,onProgress
       }else if(status.server==='idle')current={stage:'loading',detail:'Loading Qwen on your own Kaggle GPU.'};
     }
     if(probeNotebook&&status?.server==='starting'){
-      if(now()-lastQueueProbe>=30000){lastQueueProbe=now();try{queueResult=await probeNotebook();}catch(error){if([401,403].includes(error?.status))failure('Kaggle rejected the token while checking this notebook. Check the notebook first; then Forget saved token and reconnect with a new token.');queueResult=null;connection='queue_unavailable';}}
+      if(now()-lastQueueProbe>=30000){
+        lastQueueProbe=now();
+        try{queueResult=await probeNotebook();queueDiagnostic='';}
+        catch(error){
+          if(error?.status===401)failure('Kaggle authentication failed while reading this notebook status (GetKernelSessionStatus HTTP 401). Check your Kaggle authentication before another launch.');
+          queueResult=null;
+          // Reading a private notebook can be forbidden even after Kaggle accepted
+          // its GPU launch. The authenticated relay remains authoritative for boot.
+          const diagnostic=error?.status===403?'Kaggle denied permission to read this notebook status (GetKernelSessionStatus HTTP 403). Continuing to wait for authenticated notebook startup reports.':'Kaggle notebook status lookup is unavailable. Continuing to wait for authenticated notebook startup reports.';
+          if(diagnostic!==queueDiagnostic){publish({...current,state:'running',line:diagnostic,connection:'queue_unavailable'});if(!onProgress)log(diagnostic);}
+          queueDiagnostic=diagnostic;
+        }
+      }
+      if(queueDiagnostic&&connection==='connected')connection='queue_unavailable';
       if(['ERROR','COMPLETE','CANCELED','CANCELLED','CANCEL_ACKNOWLEDGED'].includes(queueResult?.status))failure('Kaggle reports this notebook '+queueResult.status.toLowerCase()+'. Open its notebook logs to check quota, GPU availability or startup errors before retrying.');
       if(queueResult?.status==='QUEUED'&&(!status.boot||status.boot.stage==='queued'))current={stage:'queued',detail:'Kaggle confirmed this notebook is queued for GPUs. Model installation and loading have not started.'};
       else if(queueResult?.status==='RUNNING'&&(!status.boot||status.boot.stage==='queued'))current={stage:'connecting',detail:'Kaggle reports the notebook is running. Waiting for its first Python startup log; the model is not ready yet.'};

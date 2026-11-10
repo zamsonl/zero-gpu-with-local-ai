@@ -116,15 +116,41 @@ async function deletionEvidence(env,token,owner,fetcher){
   throw new HttpError(409,'personal_inventory_unconfirmed','The complete notebook inventory could not be checked within the connection budget. No stale record was reset.',{launch_uncertain:true});
 }
 
+async function verifiedNotebookIdentity(meta,env,token,fetcher,slug){
+  const found=await kaggleCall(env,token,'kernels.KernelsApiService','GetKernel',{userName:meta.owner,kernelSlug:slug},fetcher).catch(()=>null);
+  const source=found?.blob?.source;
+  const launch=typeof source==='string'?/^LAUNCH_TOKEN = ["']([a-f0-9]{64})["']$/m.exec(source)?.[1]:null;
+  if(typeof source!=='string'||!source.includes('/_agent/'+meta.id)||!launch||!await equalHash(launch,meta.launch_hash)||typeof found.metadata?.ref!=='string'||found.metadata.ref.toLowerCase()!==(meta.owner+'/'+slug).toLowerCase())return null;
+  try{return canonicalNotebookIdentity({ref:found.metadata.ref,kernelId:found.metadata.id},meta.owner);}catch{return null;}
+}
+
+async function repairLegacyIdentity(db,meta,env,token,fetcher){
+  if(meta.launch_state!=='launched'||meta.canonical_ref||!meta.version)return null;
+  const identity=await verifiedNotebookIdentity(meta,env,token,fetcher,'qwen-local-coding-agent');
+  if(!identity)return null;
+  await db.prepare("UPDATE state SET v=json_set(v,'$.slug',?1,'$.url',?2,'$.canonical_ref',?3,'$.kernel_id',?4,'$.identity_repaired_at',?5),updated_at=?5 WHERE k=?6 AND json_extract(v,'$.canonical_ref') IS NULL").bind(identity.slug,identity.url,identity.canonical_ref,identity.kernel_id??null,now(),metaKey(meta.id)).run();
+  return read(db,metaKey(meta.id));
+}
+
 async function reconcileLaunch(db,meta,env,token,fetcher,recovery){
   if(rejectedLaunch(meta)||meta.ended_at)return meta;
   try{
     const result=await kaggleCall(env,token,'kernels.KernelsApiService','GetKernelSessionStatus',{userName:meta.owner,kernelSlug:meta.slug},fetcher);
     if(typeof result.status!=='string'||!result.status.trim())throw new HttpError(502,'kaggle_unknown','Kaggle did not return a notebook status.');
-    const updated={...meta,launch_state:'launched',reconciled_at:now(),kaggle_status:String(result.status).toUpperCase(),...(terminalKaggleStatus(result.status)?{ended_at:now()}:{} )};
+    let cancelledWithoutReservation=false;
+    if(String(result.status).toUpperCase()==='CANCEL_REQUESTED'){
+      const [shutdown,target,heartbeat]=await Promise.all([read(db,prefix(meta.id)+'shutdown'),read(db,prefix(meta.id)+'target'),read(db,prefix(meta.id)+'client_activity')]);
+      if(shutdown&&!target&&!clientActive(heartbeat)){
+        const quota=await kaggleCall(env,token,'kernels.KernelsApiService','GetAcceleratorQuotaStatistics',{},fetcher).catch(()=>null);
+        cancelledWithoutReservation=typeof quota?.gpuQuota?.timeReserved==='string'&&/^0(?:\.0{1,9})?s$/.test(quota.gpuQuota.timeReserved);
+      }
+    }
+    const updated={...meta,launch_state:'launched',reconciled_at:now(),kaggle_status:String(result.status).toUpperCase(),...(terminalKaggleStatus(result.status)||cancelledWithoutReservation?{ended_at:now(),...(cancelledWithoutReservation?{ended_reason:'shutdown_requested_no_reserved_gpu'}:{})}:{} )};
     await write(db,metaKey(meta.id),updated);return updated;
   }catch(error){
     if([403,404].includes(error?.extra?.upstream_status)){
+      const repaired=await repairLegacyIdentity(db,meta,env,token,fetcher);
+      if(repaired?.canonical_ref)return reconcileLaunch(db,repaired,env,token,fetcher,recovery);
       if(recovery?.confirmed&&legacyUnconfirmed(meta)&&meta.owner.toLowerCase()===recovery.owner.toLowerCase()){
         const age=Date.now()-Date.parse(meta.created_at);
         const [target,heartbeat,boot]=await Promise.all([read(db,prefix(meta.id)+'target'),read(db,prefix(meta.id)+'client_activity'),read(db,prefix(meta.id)+'boot')]);
@@ -199,6 +225,19 @@ async function reserveLaunch(db,owner,id,env,token,fetcher,recovery){
 
 function descriptor(origin,meta,key){return {relay:origin+'/_agent/'+meta.id,key,session_id:meta.id,host:'kaggle',owner:meta.owner,expires_at:meta.expires_at,url:meta.url,launch_state:meta.launch_state,...(meta.model?{model_profile:{source_url:meta.model.url,label:meta.model.label,context:meta.model.context,quant:meta.model.quant,num_batch:128,profile_id:meta.model.profile_id}}:{})};}
 
+/** Kaggle derives new slugs from titles. Persist its authenticated returned identity. */
+export function canonicalNotebookIdentity(saved,owner){
+  const fail=()=>new HttpError(502,'kaggle_identity_unconfirmed','Kaggle accepted the request but did not return a consistent notebook identity. The existing launch remains reserved; do not submit another.',{origin:'kaggle',operation:'SaveKernel',launch_uncertain:true});
+  let url;
+  if(saved.url!==undefined){try{url=new URL(saved.url);}catch{throw fail();}
+    if(!['https://www.kaggle.com','https://kaggle.com'].includes(url.origin)||url.username||url.password||url.search||url.hash||!/^\/code\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\/?$/.test(url.pathname))throw fail();}
+  const ref=saved.ref??(url?url.pathname.replace(/^\/code\//,'').replace(/\/$/,''):null);
+  if(typeof ref!=='string'||!new RegExp('^'+owner+'/[A-Za-z0-9_-]+$','i').test(ref)||url&&url.pathname.replace(/^\/code\//,'').replace(/\/$/,'').toLowerCase()!==ref.toLowerCase())throw fail();
+  const slug=ref.split('/')[1],kernelId=saved.kernelId;
+  if(kernelId!==undefined&&!(Number.isSafeInteger(kernelId)&&kernelId>0)&&!(typeof kernelId==='string'&&/^[1-9][0-9]{0,19}$/.test(kernelId)))throw fail();
+  return {slug,url:`https://www.kaggle.com/code/${owner}/${slug}`,canonical_ref:owner+'/'+slug,...(kernelId===undefined?{}:{kernel_id:String(kernelId)})};
+}
+
 export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveModel=resolveHuggingFaceModel}){
   try{
     const body=await readJsonObject(request,8192);
@@ -220,7 +259,7 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
       if((existing.model?.url||null)!==(requestedModel?.url||null))throw new HttpError(409,"personal_model_changed","This launch identity belongs to another model. Stop its notebook before starting a different model.");
       if(existing.owner!==owner||Date.parse(existing.expires_at)<=Date.now())throw new HttpError(409,'personal_session_expired','This launch identity has expired. Start a new helper launch after checking your notebook.',{origin:'connector',launch_uncertain:false});
       if(!(await equalHash(key,existing.helper_hash)))throw new HttpError(409,'personal_session_changed','The relay signing key changed. Check the old notebook before launching again.');
-      if(['failed','unknown','creating'].includes(existing.launch_state))existing=await reconcileLaunch(env.DB,existing,env,body.kaggle_token,fetcher,recovery);
+      if(['failed','unknown','creating'].includes(existing.launch_state)||existing.launch_state==='launched'&&!existing.canonical_ref)existing=await reconcileLaunch(env.DB,existing,env,body.kaggle_token,fetcher,recovery);
       if(rejectedLaunch(existing))throw new HttpError(502,'personal_launch_refused','The previous notebook submission was refused or confirmed absent. Retry creates a new launch reference after the short retry delay.',{...existing.launch_error,origin:existing.launch_error?.origin||'connector',launch_uncertain:false});
       if(existing.ended_at)throw new HttpError(409,'personal_session_ended','The notebook for this launch reference has finished. Start a new helper launch.',{origin:'connector',launch_uncertain:false});
       return json(descriptor(new URL(request.url).origin,existing,key),existing.launch_state==='creating'?202:200);
@@ -239,14 +278,23 @@ export async function bootstrapAgentSession({request,env,fetcher=fetch,resolveMo
       const reservation=await read(env.DB,'agent:rate:'+await digest(owner.toLowerCase()));
       if(!reservation?.launches?.some(item=>item.id===id))throw new Error('Launch reservation was superseded before submission.');
       await write(env.DB,prefix(id)+'boot',{host:'kaggle',stage:'queued',detail:'Notebook submitted to Kaggle. Waiting for the first startup report; GPU queue state is not yet confirmed.',at:now()});
-      payload={slug:`${owner}/${slug}`,newTitle:'Qwen Local Coding Agent',text:serverScript({relay:base,token:launchToken,quant:model?.quant||'Q5_K_P',contexts:model?[32768,24576,16384,8192]:[98304],vision:false,cacheId:personalCache?.cache_id||(cacheDataset?env.KAGGLE_CACHE_ID||'':''),numBatch:model?128:256,profileId:model?.profile_id||'personal-agent-q5-kv8-b256-96k',agentOnly:true,modelSpec:model,personalCacheSpec:personalCache?.spec||null}),language:'python',kernelType:'script',isPrivate:true,enableGpu:true,enableInternet:true,machineShape:'NvidiaTeslaT4',kernelExecutionType:'SAVE_AND_RUN_ALL',datasetDataSources:cacheDataset?[cacheDataset]:[],kernelDataSources:[],competitionDataSources:[],modelDataSources:[],categoryIds:[]};
+      payload={slug:`${owner}/${slug}`,newTitle:slug,text:serverScript({relay:base,token:launchToken,quant:model?.quant||'Q5_K_P',contexts:model?[32768,24576,16384,8192]:[98304],vision:false,cacheId:personalCache?.cache_id||(cacheDataset?env.KAGGLE_CACHE_ID||'':''),numBatch:model?128:256,profileId:model?.profile_id||'personal-agent-q5-kv8-b256-96k',agentOnly:true,modelSpec:model,personalCacheSpec:personalCache?.spec||null}),language:'python',kernelType:'script',isPrivate:true,enableGpu:true,enableInternet:true,machineShape:'NvidiaTeslaT4',kernelExecutionType:'SAVE_AND_RUN_ALL',datasetDataSources:cacheDataset?[cacheDataset]:[],kernelDataSources:[],competitionDataSources:[],modelDataSources:[],categoryIds:[]};
     }catch{
       metadata.launch_state='failed';metadata.launch_error={origin:'connector',operation:'PrepareKernel',submission_sent:false};await write(env.DB,metaKey(id),metadata).catch(()=>{});
       throw new HttpError(503,'personal_prepare_failed','The personal notebook could not be prepared. No Kaggle start request was sent.',{...metadata.launch_error,launch_uncertain:false});
     }
     try{
       const saved=await kaggleCall(env,body.kaggle_token,'kernels.KernelsApiService','SaveKernel',payload,fetcher);
-      metadata.launch_state='launched';metadata.version=saved.versionNumber??null;
+      metadata.version=saved.versionNumber??null;metadata.accepted_at=now();
+      let identity;
+      try{identity=canonicalNotebookIdentity(saved,owner);}catch(error){
+        // Some SaveKernel responses use an edit/relative URL or omit identity
+        // fields. Read the owned notebook back and verify its scoped source.
+        identity=await verifiedNotebookIdentity(metadata,env,body.kaggle_token,fetcher,slug);
+        if(!identity)throw error;
+      }
+      Object.assign(metadata,identity);
+      metadata.launch_state='launched';
       await write(env.DB,metaKey(id),metadata);
       return json(descriptor(new URL(request.url).origin,metadata,key),201);
     }catch(error){

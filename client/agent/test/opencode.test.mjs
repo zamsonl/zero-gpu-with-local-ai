@@ -604,6 +604,39 @@ test('structured setup progress preserves the failed operation and safe notebook
 test('readiness distinguishes Kaggle running from a confirmed GPU queue and drops repeated GUI log spam',async()=>{const events=[],logs=[];let count=0,now=0,probes=0;assert.equal(await waitForOwnReady(session(),{now:()=>now,pause:async()=>{now+=5000;},probeNotebook:async()=>{probes++;return {status:'RUNNING'};},onProgress:e=>events.push(e),log:x=>logs.push(x),request:async(_s,path)=>path==='/v1/server/log'?{log:''}:++count>3?{server:'ready',num_ctx:98304}:{server:'starting',boot:{stage:'queued',detail:'Submitted to Kaggle'}}}),true);assert.equal(probes,1);assert(events.some(e=>e.stage==='connecting'&&e.detail.includes('Kaggle reports the notebook is running')));assert(!events.some(e=>e.detail.includes('confirmed this notebook is queued')));assert(!logs.some(x=>x.includes('elapsed. Ctrl+C')));});
 test('a terminal Kaggle notebook status stops waiting without another launch',async()=>{let now=0;await assert.rejects(waitForOwnReady(session(),{now:()=>now,pause:async()=>{now+=5000;},probeNotebook:async()=>({status:'ERROR'}),log(){},request:async()=>({server:'starting',boot:{stage:'queued',detail:'Submitted'}})}),/Kaggle reports this notebook error/);assert.equal(now,0);});
 
+test('a forbidden Kaggle status probe preserves authenticated boot progress until the relay reports ready',async()=>{
+  const events=[],logs=[];let now=0,index=0,probes=0;
+  const statuses=[{server:'starting',boot:{stage:'queued',detail:'Notebook accepted.'}},{server:'starting',boot:{stage:'installing',detail:'Preparing cached runtime.'}},{server:'starting',boot:{stage:'loading',detail:'Loading the exact model.'}},{server:'ready',num_ctx:98304}];
+  const ready=await waitForOwnReady(session(),{now:()=>now,pause:async()=>{now+=5000;},onProgress:event=>events.push(event),log:line=>logs.push(line),probeNotebook:async()=>{probes++;throw Object.assign(new Error('Provider body '+TOKEN),{status:403});},request:async(_session,route)=>route==='/v1/server/log'?{log:'Python startup is progressing.'}:statuses[index++]});
+  assert.equal(ready,true);assert.equal(probes,1);assert(events.some(event=>event.connection==='queue_unavailable'&&event.line?.includes('GetKernelSessionStatus HTTP 403')));assert(events.some(event=>event.stage==='loading'&&event.detail==='Loading the exact model.'));assert.equal(events.at(-1).stage,'ready');
+  const output=JSON.stringify(events)+logs.join('\n');assert(!/token.*reject|forget saved token|new token/i.test(output));assert(!output.includes(TOKEN));assert(!events.some(event=>event.state==='error'));
+});
+
+test('status-probe HTTP403 never requests shutdown of an accepted notebook before healthy startup completes',async()=>{
+  const f=fixture();let now=0,polls=0;
+  f.deps.probeNotebook=async()=>{throw Object.assign(new Error('Forbidden'),{status:403});};
+  f.deps.waitForReady=(own,options)=>waitForOwnReady(own,{...options,now:()=>now,pause:async()=>{now+=5000;},request:async(_session,route)=>{assert.equal(f.shutdown,0);return route==='/v1/server/log'?{log:''}:++polls<3?{server:'starting',boot:{stage:polls===1?'queued':'loading',detail:'Authenticated startup report.'}}:{server:'ready',num_ctx:98304};}});
+  const running=await launchOpenCode(launchArgs,f.deps);assert.equal(f.shutdown,0);assert(f.calls.includes('spawn'));assert(!f.logs.some(line=>/token.*reject|forget saved token/i.test(line)));await running.close();assert.equal(f.shutdown,1);
+});
+
+test('persistent forbidden queue lookups retain the startup deadline and emit one diagnostic',async()=>{
+  const events=[];let now=0,probes=0;
+  await assert.rejects(waitForOwnReady(session(),{now:()=>now,timeoutMs:65000,pause:async()=>{now+=5000;},log(){},onProgress:event=>events.push(event),probeNotebook:async()=>{probes++;throw Object.assign(new Error('Forbidden'),{status:403});},request:async(_session,route)=>route==='/v1/server/log'?{log:''}:{server:'starting',boot:{stage:'queued',detail:'Waiting for startup.'}}}),/did not become ready within two hours/);
+  assert.equal(now,65000);assert.equal(probes,3);assert.equal(events.filter(event=>event.line?.includes('GetKernelSessionStatus HTTP 403')).length,1);
+});
+
+test('cancellation and ended relay sessions remain bounded after an unavailable queue probe',async()=>{
+  const cancellation=new AbortController();let probes=0;
+  assert.equal(await waitForOwnReady(session(),{signal:cancellation.signal,log(){},pause:async()=>cancellation.abort(),probeNotebook:async()=>{probes++;throw Object.assign(new Error('Forbidden'),{status:403});},request:async()=>({server:'starting'})}),false);assert.equal(probes,1);
+  for(const status of [409,410]){let requests=0;await assert.rejects(waitForOwnReady(session(),{log(){},pause:async()=>assert.fail('Ended sessions must not enter a retry loop'),request:async()=>{requests++;throw Object.assign(new Error('Ended'),{status});}}),/session has ended or was asked to stop/);assert.equal(requests,1);}
+});
+
+test('Kaggle queue HTTP401 remains distinct from private-status HTTP403 and actual relay authentication failure',async()=>{
+  let probes=0;
+  await assert.rejects(waitForOwnReady(session(),{log(){},pause:async()=>assert.fail('Authentication failure must be bounded'),probeNotebook:async()=>{probes++;throw Object.assign(new Error('Unauthorized'),{status:401});},request:async()=>({server:'starting'})}),/GetKernelSessionStatus HTTP 401/);assert.equal(probes,1);
+  for(const status of [401,403])await assert.rejects(waitForOwnReady(session(),{log(){},request:async()=>{throw Object.assign(new Error('Unauthorized'),{status});}}),/personal Kaggle session credential was rejected/);
+});
+
 test('custom GGUF uses measured context and preserves approvals with automatic compaction',()=>{const own={...session(),model_profile:{label:'Selected GGUF',context:8192,quant:'Q4_K_M',num_batch:128,profile_id:'hfgguf:'+'a'.repeat(24),thinking:false}};const config=createOpenCodeConfig(own),model=config.provider['personal-kaggle-qwen'].models['qwen3.8-hauhau'];assert.equal(model.limit.context,8192);assert.equal(model.limit.input,8192);assert.equal(model.limit.output,2048);assert.equal(model.reasoning,false);assert.equal(config.compaction.reserved,2048);assert.equal(config.compaction.preserve_recent_tokens,2048);assert.equal(config.permission.bash,'ask');assert.equal(config.permission.edit['*'],'ask');assert.equal(config.autoupdate,false);});
 
 test('unsupported custom model hosts fail before local tool setup or token access',async()=>{await assert.rejects(launchOpenCode(['--model-url','https://ollama.com/library/qwen'],{log(){},loadSavedToken:async()=>{assert.fail('Invalid model must not read a token');}}),/Hugging Face GGUF only/);});

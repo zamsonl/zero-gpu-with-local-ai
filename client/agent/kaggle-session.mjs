@@ -32,7 +32,7 @@ export function validatePersonalSession(value,{now=Date.now(),requireFresh=true}
   const expected=RELAY_ORIGIN+'/_agent/'+value.session_id;
   if(value.relay!==expected||relay.username||relay.password||relay.search||relay.hash||
      !['https://www.kaggle.com','https://kaggle.com'].includes(notebook.origin)||notebook.username||notebook.password||notebook.search||notebook.hash||
-     !new RegExp('^/code/'+value.owner+'/qwen-agent-[A-Za-z0-9_-]+/?$').test(notebook.pathname))throw new Error('The service did not return an isolated notebook connection for your Kaggle account.');
+     !new RegExp('^/code/'+value.owner+'/[A-Za-z0-9_-]+/?$').test(notebook.pathname))throw new Error('The service did not return an isolated notebook connection for your Kaggle account.');
   const expiry=Date.parse(value.expires_at);
   if(!Number.isFinite(expiry)||requireFresh&&(expiry<=now||expiry>now+14*3600000))throw new Error('The personal Kaggle session has an invalid expiry.');
   const profile=value.model_profile;
@@ -43,7 +43,7 @@ export function validatePersonalSession(value,{now=Date.now(),requireFresh=true}
 async function launchFailure(response){
   let remote=null;const reader=response.body?.getReader();
   if(reader){try{let text='',size=0;const decoder=new TextDecoder();for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>8192)break;text+=decoder.decode(value,{stream:true});}if(size<=8192)remote=JSON.parse(text+decoder.decode())?.error;}catch{}finally{await reader.cancel().catch(()=>{});reader.releaseLock();}}
-  const allowed=new Set(['personal_launch_limit','personal_retry_cooldown','personal_session_active','personal_launch_unconfirmed','personal_launch_refused','personal_session_expired','personal_session_ended','personal_prepare_failed','personal_token_invalid','kaggle_refused','kaggle_rate_limit','kaggle_unknown','kaggle_not_found','personal_notebook_inaccessible','personal_inventory_unconfirmed','personal_gpu_state_unconfirmed']);
+  const allowed=new Set(['personal_launch_limit','personal_retry_cooldown','personal_session_active','personal_launch_unconfirmed','personal_launch_refused','personal_session_expired','personal_session_ended','personal_prepare_failed','personal_token_invalid','kaggle_refused','kaggle_rate_limit','kaggle_unknown','kaggle_not_found','personal_notebook_inaccessible','kaggle_identity_unconfirmed','personal_inventory_unconfirmed','personal_gpu_state_unconfirmed']);
   const code=allowed.has(remote?.code)?remote.code:response.status===429?'personal_launch_limit':response.status===409?'personal_session_active':response.status===401||response.status===403?'personal_token_invalid':'launch_unconfirmed';
   const origin=remote?.origin==='kaggle'?'kaggle':'connector';
   const operation=['SaveKernel','GetKernelSessionStatus','IntrospectToken','PrepareKernel','ListKernels','GetAcceleratorQuotaStatistics'].includes(remote?.operation)?remote.operation:null;

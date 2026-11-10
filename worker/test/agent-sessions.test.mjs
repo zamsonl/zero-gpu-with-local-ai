@@ -5,7 +5,7 @@ import {randomUUID} from 'node:crypto';
 import {spawn,spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {setTimeout as delay} from 'node:timers/promises';
-import {AgentStateDB} from '../src/agent-sessions.js';
+import {AgentStateDB,canonicalNotebookIdentity} from '../src/agent-sessions.js';
 import {startStack,WORKER_DIR} from './dev-stack.mjs';
 import {startMockOllama} from './mock-ollama.mjs';
 
@@ -15,8 +15,37 @@ const OWNER='KGAT_owner_MUST_NEVER_BE_USED_12345';
 const accounts=new Map([[ALICE,'alice'],[BOB,'bob']]);
 const clientIds={alice:randomUUID(),bob:randomUUID()};
 const action={action:'answer',message:'Personal Qwen fixture complete.',path:'',content:'',command:'',query:'',offset:0};
+
+test('canonical notebook identity follows authenticated Kaggle response, not an invented URL',()=>{
+  const identity=canonicalNotebookIdentity({ref:'alice/qwen-local-coding-agent',url:'https://www.kaggle.com/code/alice/qwen-local-coding-agent',kernelId:1234567},'alice');
+  assert.equal(identity.slug,'qwen-local-coding-agent');assert.equal(identity.kernel_id,'1234567');
+  assert.equal(canonicalNotebookIdentity({url:'https://www.kaggle.com/code/alice/qwen-agent-exact'},'alice').canonical_ref,'alice/qwen-agent-exact');
+  for(const value of [{},{ref:'bob/qwen-agent-x'},{ref:'alice/qwen-agent-x',url:'https://www.kaggle.com/code/alice/other'},{url:'https://evil.invalid/code/alice/qwen-agent-x'},{url:'https://www.kaggle.com/code/alice/qwen-agent-x?secret=hidden'},{ref:'alice/qwen-agent-x',kernelId:-1}])assert.throws(()=>canonicalNotebookIdentity(value,'alice'),error=>error.code==='kaggle_identity_unconfirmed'&&error.extra.launch_uncertain===true);
+});
+
+for(const matched of [true,false])test(`incomplete SaveKernel identity uses source-verified readback without resubmission (${matched})`,async()=>{
+  const owner=matched?'savereadback':'savemismatch',token='KGAT_fixture_'+owner+'_01234567890123';accounts.set(token,owner);oddSaveResponses.set(owner,matched);
+  const before=pushes.length,client=randomUUID(),response=await bootstrap(token,client);assert.equal(response.status,matched?201:202);assert.equal(pushes.length,before+1);
+  const own=await response.json(),meta=JSON.parse((await stack.sql("SELECT v FROM state WHERE k='agent:session:"+own.session_id+"'"))[0].v);
+  assert.equal(meta.launch_state,matched?'launched':'unknown');assert.equal(meta.canonical_ref,matched?owner+'/'+meta.slug:undefined);
+  if(!matched){await bootstrap(token,client);assert.equal(pushes.length,before+1);}
+});
+
+for(const matched of [true,false])test(`legacy title-derived identity repair requires the original scoped launch secret (${matched})`,async()=>{
+  const owner=matched?'canonicallegacy':'canonicalforeign',token='KGAT_fixture_'+owner+'_01234567890123';accounts.set(token,owner);
+  const first=await bootstrap(token,randomUUID());assert.equal(first.status,201);const own=await first.json();
+  const old=JSON.parse((await stack.sql("SELECT v FROM state WHERE k='agent:session:"+own.session_id+"'"))[0].v);delete old.canonical_ref;delete old.kernel_id;
+  await stack.sql("UPDATE state SET v='"+JSON.stringify(old).replaceAll("'","''")+"' WHERE k='agent:session:"+old.id+"'");
+  await ageLaunchReservation(old.id);statuses.set(old.slug,{http:403});statuses.set('qwen-local-coding-agent','COMPLETE');
+  const source=pushes.find(item=>item.owner===owner).body.text;
+  kernelSources.set(owner,{metadata:{ref:owner+'/qwen-local-coding-agent',id:98765},blob:{source:matched?source:source.replace(/^LAUNCH_TOKEN = .+$/m,'LAUNCH_TOKEN = "'+'a'.repeat(64)+'"')}});
+  const before=pushes.length,response=await bootstrap(token,randomUUID());assert.equal(response.status,matched?201:409);assert.equal(pushes.length,before+(matched?1:0));
+  const repaired=JSON.parse((await stack.sql("SELECT v FROM state WHERE k='agent:session:"+old.id+"'"))[0].v);
+  if(matched){assert.equal(repaired.slug,'qwen-local-coding-agent');assert.equal(repaired.canonical_ref,owner+'/qwen-local-coding-agent');assert(repaired.ended_at);}
+  else{assert.equal(repaired.canonical_ref,undefined);assert.equal(repaired.ended_at,undefined);}
+});
 let stack,kaggleServer,aliceModel,bobModel,aliceProxy,bobProxy,alice,bob;
-const pushes=[],calls=[],statuses=new Map(),lostSaveAck=new Set(),saveRefusals=new Map(),inventories=new Map(),quotas=new Map();
+const pushes=[],calls=[],statuses=new Map(),lostSaveAck=new Set(),saveRefusals=new Map(),inventories=new Map(),quotas=new Map(),kernelSources=new Map(),oddSaveResponses=new Map();
 async function personalKaggle(req,res){
   let raw='';for await(const chunk of req)raw+=chunk;
   const body=JSON.parse(raw||'{}');const token=(req.headers.authorization||'').replace(/^Bearer /,'');
@@ -24,9 +53,10 @@ async function personalKaggle(req,res){
   const respond=(value,status=200)=>{res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(value));};
   if(!owner)return respond({message:'Rejected supplied test credential.'},401);
   if(req.url.endsWith('/IntrospectToken'))return respond({active:body.token===token,username:owner});
+  if(req.url.endsWith('/GetKernel'))return respond(kernelSources.get(owner)||{},kernelSources.has(owner)?200:403);
   if(req.url.endsWith('/ListKernels')){const pages=inventories.get(owner);const result=typeof pages==='function'?await pages(body):pages;return result?.http?respond({error:{message:'Inventory unavailable'}},result.http):respond(result||{});}
   if(req.url.endsWith('/GetAcceleratorQuotaStatistics')){const result=quotas.get(owner);return result?.http?respond({error:{message:'Quota unavailable'}},result.http):respond(result||{gpuQuota:{timeReserved:'0s'}});}
-  if(req.url.endsWith('/SaveKernel')){pushes.push({owner,body});if(lostSaveAck.delete(owner)){req.socket.destroy();return;}const refused=saveRefusals.get(owner);if(refused)return respond(refused.body||{error:{code:refused.status,message:'Dataset permission refused '+token}},refused.status);return respond({versionNumber:1,url:`https://www.kaggle.com/code/${body.slug}`});}
+  if(req.url.endsWith('/SaveKernel')){pushes.push({owner,body});if(lostSaveAck.delete(owner)){req.socket.destroy();return;}const refused=saveRefusals.get(owner);if(refused)return respond(refused.body||{error:{code:refused.status,message:'Dataset permission refused '+token}},refused.status);const canonical=owner+'/'+body.newTitle.toLowerCase().replace(/\s+/g,'-');if(oddSaveResponses.has(owner)){kernelSources.set(owner,{metadata:{ref:canonical,id:1000+pushes.length},blob:{source:oddSaveResponses.get(owner)?body.text:body.text.replace(/^LAUNCH_TOKEN = .+$/m,'LAUNCH_TOKEN = \"'+'a'.repeat(64)+'\"')}});return respond({versionNumber:1,ref:'',kernelId:0,url:'/code/'+canonical+'/edit'});}return respond({versionNumber:1,kernelId:1000+pushes.length,ref:canonical,url:`https://www.kaggle.com/code/${canonical}`});}
   if(req.url.endsWith('/GetKernelSessionStatus')){const status=statuses.has(body.kernelSlug)?statuses.get(body.kernelSlug):'RUNNING';return typeof status==='object'?respond({error:{message:'Fixture lookup unavailable'}},status.http):respond({status});}
   return respond({message:'No such mocked Kaggle method'},404);
 }
@@ -84,7 +114,7 @@ test('personal launch uses token identity, private unique notebook and code-only
   assert.equal(alice.owner,'alice');assert.equal(bob.owner,'bob');assert.notEqual(alice.session_id,bob.session_id);assert.notEqual(alice.key,bob.key);
   assert.equal(alice.relay,stack.url+'/_agent/'+alice.session_id);
   for(const {owner,body}of pushes){
-    assert(body.slug.startsWith(owner+'/qwen-agent-'));assert.equal(body.isPrivate,true);assert.deepEqual(body.datasetDataSources,[]);assert.equal(body.enableGpu,true);
+    assert(body.slug.startsWith(owner+'/qwen-agent-'));assert.equal(body.slug,owner+'/'+body.newTitle.toLowerCase().replace(/\s+/g,'-'));assert.equal(body.isPrivate,true);assert.deepEqual(body.datasetDataSources,[]);assert.equal(body.enableGpu,true);
     assert.match(body.text,/AGENT_ONLY = True/);assert.match(body.text,/QUANT = "Q5_K_P"/);assert.match(body.text,/CONTEXTS = \[98304\]/);assert.match(body.text,/BATCH_SIZE = 256/);
     assert.match(body.text,/max_job_seconds=7200, max_stream_seconds=300/);
     assert(!body.text.includes(OWNER));assert(!body.text.includes(ALICE));assert(!body.text.includes(BOB));assert(!body.text.includes('owner/private-cache/1'));
@@ -364,6 +394,16 @@ for(const scenario of ['present','foreign','null-list','loop-page','inventory403
 });
 test('recovery confirmation cannot be a truthy string',async()=>{
   const before=calls.length,response=await bootstrap(ALICE,randomUUID(),{confirm_deleted_notebooks:'yes'});assert.equal(response.status,400);assert.equal(calls.length,before);
+});
+
+for(const reserved of ['0s','1s',null])test(`requested cancellation releases logical tracking only with explicit zero reservation (${reserved})`,async()=>{
+  const owner='cancelquota'+(reserved===null?'unknown':reserved[0]),{token,metadata}=await failedLaunchFixture(owner);
+  metadata.launch_state='launched';metadata.version=1;delete metadata.key;delete metadata.launch_error;
+  await stack.sql("UPDATE state SET v='"+JSON.stringify(metadata).replaceAll("'","''")+"' WHERE k='agent:session:"+metadata.id+"'");
+  await stack.sql("INSERT INTO state(k,v,updated_at) VALUES('agent:data:"+metadata.id+":shutdown','{}','"+new Date().toISOString()+"')");
+  await ageLaunchReservation(metadata.id);saveRefusals.delete(owner);statuses.set(metadata.slug,'CANCEL_REQUESTED');quotas.set(owner,reserved===null?{}:{gpuQuota:{timeReserved:reserved}});
+  const before=pushes.length,response=await bootstrap(token,randomUUID());
+  assert.equal(response.status,reserved==='0s'?201:409);assert.equal(pushes.length,before+(reserved==='0s'?1:0));
 });
 
 test('an in-flight reservation with no metadata cannot be bypassed by a second launch identity',async()=>{

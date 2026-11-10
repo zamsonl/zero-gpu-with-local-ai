@@ -31,7 +31,7 @@ function fixture(){
 
 test('first setup uses one private CPU builder and later launches reuse a pinned owned Dataset',async()=>{
   const f=fixture(),first=await f.prepare();assert.equal(first.response.status,200);assert.equal(first.value.state,'queued');assert.equal(f.pushes.length,1);
-  const pushed=f.pushes[0];assert.equal(pushed.enableGpu,false);assert.equal(pushed.isPrivate,true);assert.match(pushed.slug,/^alice\/heretic-agent-cache-build-[a-f0-9]{12}$/);assert(!pushed.text.includes(token('alice')));
+  const pushed=f.pushes[0];assert.equal(pushed.enableGpu,false);assert.equal(pushed.isPrivate,true);assert.match(pushed.slug,/^alice\/heretic-agent-cache-build-[a-f0-9]{12}$/);assert.equal(pushed.newTitle.toLowerCase().replace(/\s+/g,'-'),pushed.slug.split('/')[1]);assert(!pushed.text.includes(token('alice')));
   assert.equal((await f.report()).response.status,200);assert(!JSON.stringify([...f.db.values.values()]).includes('fixture_upload_capability_123'));const ready=await f.prepare('alice',{cache_id:first.value.cache_id});assert.equal(ready.value.state,'ready');assert.match(ready.value.dataset,/^alice\/heretic-agent-[a-f0-9]{32}\/1$/);
   assert.equal(f.creates.length,1);assert.equal(f.creates[0].isPrivate,true);assert.equal(f.creates[0].ownerSlug,'alice');assert(!JSON.stringify(ready.value).includes('fixture_upload_capability'));
   await f.prepare();assert.equal(f.pushes.length,1);assert.equal(f.creates.length,1);assert(!JSON.stringify([...f.db.values.values()]).includes(token('alice')));
