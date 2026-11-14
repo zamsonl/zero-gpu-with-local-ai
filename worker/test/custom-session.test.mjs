@@ -8,7 +8,7 @@ function fixture(owner='alice'){
   const data=new Map(),saved=[];let lookups=0;
   const db={prepare(sql){return {bind(...args){return {async first(){return data.has(args[0])?{v:data.get(args[0])}:null;},async run(){let changes=1;if(sql.startsWith('INSERT')){if(sql.includes('OR IGNORE')&&data.has(args[0]))changes=0;else data.set(args[0],args[1]);}else if(sql.startsWith('UPDATE')){if(data.get(args[2])===args[3])data.set(args[2],args[0]);else changes=0;}else if(sql.startsWith('DELETE'))data.delete(args[0]);else throw new Error('Unexpected fixture SQL');return {meta:{changes}};}};}};}};
   const env={DB:db,RELAY_KEY:'fixture-relay-secret-0123456789012345',KAGGLE_CACHE_DATASET:'alice/private-cache/2',KAGGLE_CACHE_ID:'fixture-cache'};
-  const fetcher=async(url,options)=>{lookups++;if(url.includes('IntrospectToken'))return Response.json({active:true,username:owner});if(url.includes('SaveKernel')){saved.push(JSON.parse(options.body));return Response.json({versionNumber:1});}throw new Error('Unexpected external service: '+url);};
+  const fetcher=async(url,options)=>{lookups++;if(url.includes('IntrospectToken'))return Response.json({active:true,username:owner});if(url.includes('SaveKernel')){saved.push(JSON.parse(options.body));return Response.json({ref:saved.at(-1).slug,versionNumber:1});}throw new Error('Unexpected external service: '+url);};
   const start=async(extra={},resolveModel=async()=>spec)=>bootstrapAgentSession({env,fetcher,resolveModel,request:new Request('https://relay.fixture/v1/agent/sessions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({kaggle_token:token,consent:true,client_id:'fixture-launch-0123456789',...extra})})});
   return {data,saved,start,lookups:()=>lookups};
 }

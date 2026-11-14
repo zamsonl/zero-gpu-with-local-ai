@@ -89,7 +89,7 @@ test('repeated thinking windows preserve selected effort and every source span b
   for(const think of [true,'medium','low']){
     const fixture=recoveryFixture(async function*(count){yield {message:{thinking:`Window ${count} remains provisional. `}};yield {done:true,done_reason:'stop'};},{think,budget:createJobBudget(45)});
     await assert.rejects(fixture.run,error=>error.code==='work_checkpoint');
-    const work=fixture.requests.filter(o=>!o.body.format);assert.equal(work.length,3);assert(work.every(o=>o.body.think===think&&o.body.options.num_predict===2048&&o.body.options.num_ctx===98304&&o.body.options.num_batch===256&&o.body.truncate===false&&o.body.shift===false));
+    const work=fixture.requests.filter(o=>!o.body.format);assert.equal(work.length,3);assert(work.every(o=>o.body.think===think&&o.body.options.num_predict===24576&&o.body.options.num_ctx===98304&&o.body.options.num_batch===256&&o.body.truncate===false&&o.body.shift===false));
     const saved=fixture.checkpoints.at(-1);assert.equal(saved.through_chars,fixture.reply.thinking.length);assert(await validRecovery(saved,fixture.reply.thinking));assert.equal(saved.complete_source,true);assert.equal(fixture.reply.content,'');
   }
 });
@@ -118,7 +118,7 @@ test('an already exhausted budget checkpoints an honest empty prefix without sta
 
 test('proactive cap leaves thinking effort, context, batch and original body intact',()=>{
   const body={model:'qwen3.8-hauhau',think:'medium',truncate:false,shift:false,options:{num_ctx:98304,num_batch:256,num_predict:24576}};
-  const work=thinkingWorkBody(body,'medium');assert.equal(work.options.num_predict,2048);assert.equal(body.options.num_predict,24576);assert.equal(work.think,'medium');assert.equal(work.options.num_ctx,98304);assert.equal(work.options.num_batch,256);assert.equal(thinkingWorkBody(body,false),body);
+  const work=thinkingWorkBody(body,'medium');assert.equal(work.options.num_predict,24576);assert.equal(body.options.num_predict,24576);assert.equal(work.think,'medium');assert.equal(work.options.num_ctx,98304);assert.equal(work.options.num_batch,256);assert.equal(thinkingWorkBody(body,false),body);
 });
 
 test('cumulative work budget survives a fresh request and produces one announced answer-only pass',async()=>{

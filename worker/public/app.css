@@ -1696,7 +1696,7 @@ kbd.shortcut {
   font: 13.5px/1.6 var(--ui);
   overflow-wrap: anywhere;
   scrollbar-width: thin;
-  overscroll-behavior-y: contain;
+  /* No overscroll containment: at the top of the reasoning the wheel carries on up the chat. */
   overflow-anchor: none;
 }
 

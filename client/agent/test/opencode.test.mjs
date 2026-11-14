@@ -23,12 +23,15 @@ test('the generated config allows only personal Qwen for every AI role and state
   const provider=config.provider[PROVIDER_ID];assert.equal(provider.npm,'@ai-sdk/openai-compatible');
   assert.equal(provider.options.baseURL,own.relay+'/v1');assert.equal(provider.options.apiKey,'{env:'+RELAY_KEY_ENV+'}');
   assert.deepEqual(Object.keys(provider.models),[MODEL_ID]);
-  assert.deepEqual(provider.models[MODEL_ID].limit,{context:98304,input:98304,output:8192});
+  assert.deepEqual(provider.models[MODEL_ID].limit,{context:98304,input:98304,output:16384});
   assert.deepEqual(config.compaction,{auto:true,prune:false,reserved:12288,preserve_recent_tokens:16384,tail_turns:2});
   assert(config.agent.compaction.prompt.includes('later corrections'));assert(config.agent.compaction.prompt.includes('commands and test results'));
   assert.equal(provider.models[MODEL_ID].tool_call,true);assert.equal(provider.models[MODEL_ID].attachment,false);
   assert.equal(provider.models[MODEL_ID].reasoning,true);assert.deepEqual(provider.models[MODEL_ID].interleaved,{field:'reasoning_content'});
   assert.equal(provider.models[MODEL_ID].options.reasoningEffort,'medium');assert.equal(OPEN_CODE_REQUEST_TIMEOUT_MS,2*60*60*1000);
+  // Ctrl+T in OpenCode cycles these thinking modes; none chosen behaves like normal.
+  assert.deepEqual(provider.models[MODEL_ID].variants,{fast:{reasoningEffort:'none'},light:{reasoningEffort:'low'},normal:{reasoningEffort:'medium'},deep:{reasoningEffort:'high'}});
+  assert.equal(createOpenCodeConfig({...own,model_profile:{label:'Selected GGUF',context:8192,quant:'Q4_K_M',num_batch:128,profile_id:'hfgguf:'+'a'.repeat(24),thinking:false}}).provider[PROVIDER_ID].models[MODEL_ID].variants,undefined);
   assert.equal(OPEN_CODE_TRANSPORT_TIMEOUT_MS,OPEN_CODE_REQUEST_TIMEOUT_MS+30_000);assert.equal(provider.options.timeout,OPEN_CODE_TRANSPORT_TIMEOUT_MS);
   for(const name of ['build','plan','general','explore','title','summary','compaction'])assert.equal(config.agent[name].model,MODEL);
   for(const name of ['title','summary','compaction'])assert.equal(config.agent[name].reasoningEffort,'none');
@@ -601,6 +604,19 @@ test('structured setup progress preserves the failed operation and safe notebook
   assert(stages.some(event=>event.state==='error'&&event.detail.includes('selected project is read-only')));assert.equal(f.shutdown,1);
 });
 
+test('a notebook that never reports says so after five and fifteen minutes instead of staying silent',async()=>{
+  const events=[];let now=0,polls=0;
+  assert.equal(await waitForOwnReady(session(),{now:()=>now,pause:async()=>{now+=5000;},probeNotebook:async()=>({status:''}),onProgress:e=>events.push(e),log:()=>{},
+    request:async(_s,path)=>path==='/v1/server/log'?{log:''}:++polls>200?{server:'ready',num_ctx:98304}:{server:'starting',boot:{stage:'queued',detail:'Submitted to Kaggle'}}}),true);
+  const notes=events.filter(e=>e.line?.startsWith('No startup report after'));
+  assert.deepEqual(notes.map(e=>e.line.match(/after (\d+) minutes/)[1]),['5','15']);
+  assert(notes[0].line.includes('Kaggle has not returned a status')&&notes[0].line.includes('weekly GPU quota'));
+  // A notebook that is reporting progress never gets the notice.
+  const busy=[];now=0;polls=0;
+  await waitForOwnReady(session(),{now:()=>now,pause:async()=>{now+=5000;},onProgress:e=>busy.push(e),log:()=>{},
+    request:async(_s,path)=>path==='/v1/server/log'?{log:''}:++polls>200?{server:'ready',num_ctx:98304}:{server:'starting',boot:{stage:'loading',detail:'Loading the model',at:new Date(polls*1000).toISOString()}}});
+  assert(!busy.some(e=>e.line?.startsWith('No startup report')));
+});
 test('readiness distinguishes Kaggle running from a confirmed GPU queue and drops repeated GUI log spam',async()=>{const events=[],logs=[];let count=0,now=0,probes=0;assert.equal(await waitForOwnReady(session(),{now:()=>now,pause:async()=>{now+=5000;},probeNotebook:async()=>{probes++;return {status:'RUNNING'};},onProgress:e=>events.push(e),log:x=>logs.push(x),request:async(_s,path)=>path==='/v1/server/log'?{log:''}:++count>3?{server:'ready',num_ctx:98304}:{server:'starting',boot:{stage:'queued',detail:'Submitted to Kaggle'}}}),true);assert.equal(probes,1);assert(events.some(e=>e.stage==='connecting'&&e.detail.includes('Kaggle reports the notebook is running')));assert(!events.some(e=>e.detail.includes('confirmed this notebook is queued')));assert(!logs.some(x=>x.includes('elapsed. Ctrl+C')));});
 test('a terminal Kaggle notebook status stops waiting without another launch',async()=>{let now=0;await assert.rejects(waitForOwnReady(session(),{now:()=>now,pause:async()=>{now+=5000;},probeNotebook:async()=>({status:'ERROR'}),log(){},request:async()=>({server:'starting',boot:{stage:'queued',detail:'Submitted'}})}),/Kaggle reports this notebook error/);assert.equal(now,0);});
 

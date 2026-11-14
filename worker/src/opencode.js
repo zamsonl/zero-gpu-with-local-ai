@@ -8,7 +8,17 @@ import { sleep } from './util.js';
 
 export const OPENCODE_MODEL='qwen3.8-hauhau';
 export const OPENCODE_CONTEXT=98304;
-export const OPENCODE_OUTPUT=8192;
+// One reply holds its reasoning and its tool call. At 8,192 a long write was cut off
+// mid-arguments after the reasoning had used most of the room.
+export const OPENCODE_OUTPUT=16384;
+const TOOL_RETRIES=2;
+const TOOL_GUIDANCE='Keep every tool call small enough to finish: put at most about 150 lines of text in one write or edit call, and build a longer file with several calls.';
+const TOOL_RETRY_CODES=new Set(['model_tool_parse_error','incomplete_tool_call','unfinished_tool_call']);
+function withToolGuidance(messages){
+  const at=messages.findIndex(message=>message.role==='system');
+  if(at<0)return [{role:'system',content:TOOL_GUIDANCE},...messages];
+  return messages.map((message,index)=>index===at?{...message,content:message.content+'\n\n'+TOOL_GUIDANCE}:message);
+}
 export const OPENCODE_REQUEST_MS=2*60*60_000;
 export const OPENCODE_JOB_LEG_SECONDS=300;
 const MAX_BODY=2*1024*1024, MAX_OUTPUT=1024*1024, MAX_CALLS=128;
@@ -43,6 +53,10 @@ function numberOption(body,key,min,max,target=key,integer=false){
   if(typeof body[key]!=='number'||!Number.isFinite(body[key])||body[key]<min||body[key]>max||(integer&&!Number.isSafeInteger(body[key])))throw invalid('Invalid '+key+'.');
   return {[target]:body[key]};
 }
+// OpenCode hands its summary step the thinking mode of the turn it follows, and that
+// mode outranks the summary agent's own "no thinking" setting. Notes written after a
+// long think run out of reply room and the task starts over, so a summary never thinks.
+const SUMMARY_PROMPT='Summarize this coding session for continuation';
 function thinkingEffort(body){
   const effort=body.reasoning_effort??'medium';
   if(effort==='none')return false;
@@ -78,7 +92,11 @@ export function parseOpenCodeRequest(body){
   }
   if(!Array.isArray(body.messages)||!body.messages.length||body.messages.length>MAX_MESSAGES)throw invalid('Expected a non-empty message array within the request-size limit.');
   const pending=new Map(),ids=new Set();
-  const messages=body.messages.map(message=>{
+  // Only the newest assistant step keeps its reasoning in full. Replaying every earlier
+  // step's complete reasoning filled the window within a few tool rounds, forcing a
+  // compaction that made the task start over. Older steps keep their conclusion (the tail).
+  const newestReasoned=body.messages.findLastIndex(message=>object(message)&&message.role==='assistant'&&typeof message.reasoning_content==='string'&&message.reasoning_content);
+  const messages=body.messages.map((message,position)=>{
     if(!object(message)||!['system','developer','user','assistant','tool'].includes(message.role))throw invalid('Invalid message role.');
     const role=message.role==='developer'?'system':message.role;
     const reasoning=message.reasoning_content;
@@ -104,7 +122,7 @@ export function parseOpenCodeRequest(body){
     // Native llama-server conversion drops Message.Thinking on every tool round,
     // not just the finishing call. Keep the plan in normal model-visible content
     // so a tool result does not make the next generation start from scratch.
-    return {role,content:typeof reasoning==='string'&&reasoning?workingCheckpoint({reasoning,content},true).content:content,...(calls?{tool_calls:calls}:{})};
+    return {role,content:typeof reasoning==='string'&&reasoning?workingCheckpoint({reasoning:position===newestReasoned?reasoning:trimmedReasoning(reasoning),content},true).content:content,...(calls?{tool_calls:calls}:{})};
   });
   if(pending.size)throw invalid('Tool calls require their results before requesting another completion.');
   const options={num_ctx:OPENCODE_CONTEXT,num_batch:256,num_predict:output,
@@ -121,8 +139,9 @@ export function parseOpenCodeRequest(body){
   // disagree with its compactor. The notebook rejects actual tokenizer overflow
   // with truncate/shift disabled, and never silently removes message history.
   if(body.tool_choice==='none')tools=[];
+  const summary=!tools.length&&messages.some(message=>message.role==='system'&&typeof message.content==='string'&&message.content.includes(SUMMARY_PROMPT));
   return {stream:body.stream===true,includeUsage:body.stream_options?.include_usage===true,parallel:body.parallel_tool_calls!==false,
-    tools,body:{model:OPENCODE_MODEL,messages,...(tools.length?{tools}:{}),think,stream:true,truncate:false,shift:false,keep_alive:-1,options}};
+    tools,body:{model:OPENCODE_MODEL,messages,...(tools.length?{tools}:{}),think:summary?false:think,stream:true,truncate:false,shift:false,keep_alive:-1,options}};
 }
 
 export function openCodeModels(){
@@ -183,7 +202,19 @@ function workingCheckpoint(result,historical=false){
   // content survives that conversion and the model's Jinja template. These are
   // unverified notes, not tool results or permission to execute an earlier call.
   const prefix=historical?'Saved working notes for this earlier assistant message. Plans and guesses are unverified; native tool calls and subsequent actual tool results establish what ran. Notes alone are not proof of execution.':'Unfinished working notes from this response. Plans and guesses below are unverified; only actual tool results in the preceding conversation establish completed actions. No tool call from these notes has been released.';
-  return {role:'assistant',content:prefix+'\n'+JSON.stringify({reasoning:result.reasoning,answer_so_far:result.content})};
+  // Plain text with real line breaks. As one-line JSON the model saw every earlier
+  // answer with its newlines escaped, and began writing its own answers the same way.
+  return {role:'assistant',content:prefix+'\n[notes]\n'+(result.reasoning||'')+'\n[/notes]'+(result.content?'\n'+result.content:'')};
+}
+
+export const HISTORY_REASONING_CHARS=1200;
+function trimmedReasoning(reasoning){
+  if(reasoning.length<=HISTORY_REASONING_CHARS)return reasoning;
+  // The plan and exact identifiers open a step's reasoning; its conclusion closes it.
+  let head=HISTORY_REASONING_CHARS/2,start=reasoning.length-HISTORY_REASONING_CHARS/2;
+  if(/[\uD800-\uDBFF]/.test(reasoning[head-1]))head--;
+  if(/[\uDC00-\uDFFF]/.test(reasoning[start]))start++;
+  return reasoning.slice(0,head)+' [middle of this earlier reasoning trimmed] '+reasoning.slice(start);
 }
 
 const TOOL_LOOP_REPEATS=3,TOOL_LOOP_PERIOD=8;
@@ -334,7 +365,7 @@ class Completion {
     }
     if(raw.done===true){
       if(raw.done_reason==='length'&&this.calls.length)throw new HttpError(502,'incomplete_tool_call','The model tool response reached its output limit. No complete tool response was produced.');
-      for(const call of this.calls){try{if(!object(JSON.parse(call.function.arguments)))throw new Error();}catch{throw new HttpError(502,'invalid_tool_call','The model did not finish valid JSON tool arguments.');}}
+      for(const call of this.calls){try{if(!object(JSON.parse(call.function.arguments)))throw new Error();}catch{throw new HttpError(502,'unfinished_tool_call','The model did not finish valid JSON tool arguments.');}}
       this.done=true;this.finish=raw.done_reason==='length'?'length':this.calls.length?'tool_calls':'stop';
       const input=Number.isSafeInteger(raw.prompt_eval_count)&&raw.prompt_eval_count>=0?raw.prompt_eval_count:0;
       const output=Number.isSafeInteger(raw.eval_count)&&raw.eval_count>=0?raw.eval_count:0;
@@ -362,6 +393,7 @@ export async function openCodeChat({request,env,ctx,ensureActive=async()=>{}}){
     throw error;
   }
   const parsed=parseOpenCodeRequest(body);
+  if(parsed.tools.length)parsed.body.messages=withToolGuidance(parsed.body.messages);
   const mainRequest=parsed.tools.length>0||parsed.body.think!==false;
   const selected=env.AGENT_MODEL_PROFILE;
   const configurePayload=registered=>{if(!selected)return;requireProfile(registered,selected);parsed.body.options.num_ctx=registered.num_ctx;parsed.body.options.num_batch=128;parsed.body.options.num_predict=Math.min(parsed.body.options.num_predict,Math.max(1024,Math.min(4096,Math.floor(registered.num_ctx/4))));if(registered.thinking!==true)delete parsed.body.think;};
@@ -403,9 +435,9 @@ export async function openCodeChat({request,env,ctx,ensureActive=async()=>{}}){
       await ensureActive();abort.signal.throwIfAborted();
       registered=await readTarget(env.DB);target=requireProfile(registered,selected);configurePayload(registered);
       modelStarted=true;
-      let payload=parsed.body,targetReloads=0,finished=false,recovered=false,completedOutput=0,completedReasoning=0;
+      let payload=parsed.body,targetReloads=0,finished=false,recovered=false,toolRetries=0,completedOutput=0,completedReasoning=0;
       const reloadTarget=async()=>{if(targetReloads++<3)target=requireProfile(await readTarget(env.DB),env.AGENT_MODEL_PROFILE);return target;};
-      for(let pass=0;pass<3;pass++){
+      for(let pass=0;pass<5;pass++){
         abort.signal.throwIfAborted();
         const generationContentStart=result.content.length;
         const identity={id:lock.id+(pass===0||recovered?'-main':'-finish'),token:crypto.randomUUID().replaceAll('-','')+crypto.randomUUID().replaceAll('-','')};
@@ -447,14 +479,25 @@ export async function openCodeChat({request,env,ctx,ensureActive=async()=>{}}){
         break;
         }catch(error){
           const failure=modelFailure(error);
-          const recognized=failure.code==='model_runner_stopped'||failure.code==='model_tool_parse_error';
+          const toolFailure=TOOL_RETRY_CODES.has(failure.code);
           // Tool deltas are held until terminal success, so a known failed model
           // generation has executed nothing. Preserve visible text/notes and
-          // make exactly one no-thinking continuation, never an unknown replay.
-          if(!recognized||result.calls.length||recovered||abort.signal.aborted||pass>=2||acquisitions>=5||requestBudget.used>=requestBudget.limit-6)throw failure;
-          recovered=true;finished=true;
-          payload={...parsed.body,think:false,options:{...parsed.body.options,temperature:0,num_predict:Math.min(4096,parsed.body.options.num_predict)},messages:[...parsed.body.messages,workingCheckpoint(result),
-            {role:'user',content:'The preceding model generation failed before any tool calls were released. Continue from the unfinished notes and answer text above without repeating text already written. Do not reason further. Produce the next answer or one valid native tool call. Never assume a planned tool action has run; only preceding real tool results prove execution.'}]};
+          // continue without thinking, never an unknown replay. A stopped runner
+          // gets one continuation. A cut-off or malformed tool call gets two, each
+          // with the whole reply budget and a smaller piece to write: the usual
+          // cause is one call carrying more text than a reply can hold.
+          const spent=toolFailure?toolRetries>=TOOL_RETRIES:failure.code!=='model_runner_stopped'||recovered||result.calls.length>0;
+          if(spent||abort.signal.aborted||pass>=4||acquisitions>=5||requestBudget.used>=requestBudget.limit-6){
+            if(toolFailure&&toolRetries)throw new HttpError(502,failure.code,'Qwen could not finish a valid tool call after '+toolRetries+' smaller retries. Nothing from the failed calls ran. Send "continue" and ask for the file to be written in smaller parts.');
+            throw failure;
+          }
+          recovered=true;finished=true;if(toolFailure)toolRetries++;
+          const lines=toolRetries>1?60:150;
+          const instruction=toolFailure
+            ?'The preceding tool call was cut off or its arguments were not valid JSON, so nothing ran. The usual cause is one call carrying too much text. Continue from the notes above. Do not reason further. Make one valid native tool call now. If you were writing or replacing a long text, send only the first part in this call, at most about '+lines+' lines, and add the rest with further calls afterwards. Never assume a planned tool action has run; only preceding real tool results prove execution.'
+            :'The preceding model generation failed before any tool calls were released. Continue from the unfinished notes and answer text above without repeating text already written. Do not reason further. Produce the next answer or one valid native tool call. Never assume a planned tool action has run; only preceding real tool results prove execution.';
+          payload={...parsed.body,think:false,options:{...parsed.body.options,temperature:0,num_predict:toolFailure?parsed.body.options.num_predict:Math.min(4096,parsed.body.options.num_predict)},messages:[...parsed.body.messages,workingCheckpoint(result),
+            {role:'user',content:instruction}]};
           if(selected&&registered.thinking!==true)delete payload.think;
           const prior=result;result=new Completion(parsed.tools,parsed.parallel);result.reasoning=prior.reasoning;result.content=prior.content;result.addSize(prior.reasoning+prior.content);
           // A fresh generation lock gives recovery its own authenticated job

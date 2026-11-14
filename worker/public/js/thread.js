@@ -492,8 +492,25 @@ export class AssistantView {
     this.thinkingPrevious.addEventListener("click", () => this.#readThinking(this.#thinkingStart - LIVE_REASONING_CHARS, this.#thinkingStart));
     this.thinkingNext.addEventListener("click", () => this.#readThinking(this.#thinkingEnd, this.#thinkingEnd + LIVE_REASONING_CHARS));
     this.thinkingLatest.addEventListener("click", () => this.#latestThinking());
+    let lastTop = 0;
+    const letGo = () => {
+      if (!this.#thinkingFollow) return;
+      this.#thinkingFollow = false;
+      this.#thinkingInteracted = true;
+      this.#thinkingNavigation();
+    };
+    // An upward wheel is the reader's; stop following before the next streamed frame repaints.
+    this.thinkingBody.addEventListener("wheel", (event) => {
+      if (event.deltaY < 0 && this.thinkingBody.scrollTop > 0) letGo();
+    }, { passive: true });
     this.thinkingBody.addEventListener("scroll", () => {
-      const bottom = this.thinkingBody.scrollHeight - this.thinkingBody.clientHeight - this.thinkingBody.scrollTop <= REASONING_BOTTOM_SLOP;
+      const top = this.thinkingBody.scrollTop;
+      const distance = this.thinkingBody.scrollHeight - this.thinkingBody.clientHeight - top;
+      const up = top < lastTop - 1 && distance > 1;
+      lastTop = top;
+      // Following only moves down, so a move up is a deliberate one, however small.
+      if (up) return letGo();
+      const bottom = distance <= REASONING_BOTTOM_SLOP;
       if (!bottom && this.#thinkingFollow) {
         this.#thinkingFollow = false;
         this.#thinkingInteracted = true;

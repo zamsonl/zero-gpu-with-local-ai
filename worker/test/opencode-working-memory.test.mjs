@@ -3,7 +3,8 @@ import {test} from 'node:test';
 import {parseOpenCodeRequest,assertOpenCodeToolProgress,OPENCODE_MODEL} from '../src/opencode.js';
 const tool={type:'function',function:{name:'read_file',parameters:{type:'object'}}};
 const call=(id,path)=>({id,type:'function',function:{name:'read_file',arguments:JSON.stringify({path})}});
-const checkpoint=message=>JSON.parse(message.content.split('\n').slice(1).join('\n'));
+const readNote=text=>{const m=/^[^\n]*\n\[notes\]\n([\s\S]*)\n\[\/notes\](?:\n([\s\S]*))?$/.exec(text);if(!m)throw new Error('Not a working-notes message.');return {reasoning:m[1],answer_so_far:m[2]??''};};
+const checkpoint=message=>readNote(message.content);
 
 test('plans and exact requirements survive multiple native-rendered tool rounds without restarting reasoning',()=>{
   const notes='Goal: repair C:\\project\\auth.ts; preserve request SIGNATURE_2931. 已確認規則. '+ 'Important unfinished step. '.repeat(1500);
@@ -14,10 +15,19 @@ test('plans and exact requirements survive multiple native-rendered tool rounds 
     {role:'tool',tool_call_id:'call_b',content:'Verified regression test.'}];
   const parsed=parseOpenCodeRequest({model:OPENCODE_MODEL,messages,tools:[tool]}).body;
   // Native Ollama only forwards content/tool_calls. The plan must survive there.
-  assert.equal(checkpoint(parsed.messages[1]).reasoning,notes);assert.equal(checkpoint(parsed.messages[1]).answer_so_far,'I will inspect the file.');
+  // An older step keeps its opening plan and its conclusion, not a full replay that
+  // would fill the window; the newest step's reasoning stays complete.
+  const older=checkpoint(parsed.messages[1]).reasoning;
+  assert(older.startsWith('Goal: repair C:\\project\\auth.ts; preserve request SIGNATURE_2931. 已確認規則. '));assert(older.endsWith('Important unfinished step. '));assert(older.includes('trimmed'));assert(older.length<1400);
+  assert.equal(checkpoint(parsed.messages[3]).reasoning,messages[3].reasoning_content);
+  const single=parseOpenCodeRequest({model:OPENCODE_MODEL,messages:messages.slice(0,3),tools:[tool]}).body;
+  assert.equal(checkpoint(single.messages[1]).reasoning,notes);assert.equal(checkpoint(parsed.messages[1]).answer_so_far,'I will inspect the file.');
   assert(checkpoint(parsed.messages[3]).reasoning.includes('no edit has run'));assert.equal(parsed.messages[2].content,'Verified file contents.');assert.equal(parsed.messages[4].content,'Verified regression test.');
   assert.equal(parsed.messages[1].thinking,undefined);assert.equal(parsed.messages.length,messages.length);assert(parsed.messages[1].content.includes('unverified'));
   assert.equal(parsed.messages[1].tool_calls[0].function.name,'read_file');assert.equal(parsed.messages[0].content,messages[0].content);
+  // Earlier answers reach the model with real line breaks, never as escaped one-line JSON.
+  const lined=parseOpenCodeRequest({model:OPENCODE_MODEL,messages:[{role:'user',content:'List them.'},{role:'assistant',content:'First line\nSecond line\n\n- item',reasoning_content:'Plan\nthe list.'},{role:'user',content:'Again.'}]}).body.messages[1].content;
+  assert(lined.endsWith('\nFirst line\nSecond line\n\n- item'));assert(lined.includes('\nPlan\nthe list.\n'));assert(!lined.includes('\\n'));
   assert.equal(parsed.messages[1].tool_calls[0].id,'call_a');assert.equal(parsed.messages[2].tool_call_id,'call_a');assert.equal(parsed.messages[3].tool_calls[0].id,'call_b');assert.equal(parsed.messages[4].tool_call_id,'call_b');
   assert(!parsed.messages[1].content.includes('No tool call from these notes has been released.'));
 });

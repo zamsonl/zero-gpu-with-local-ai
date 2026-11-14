@@ -17,8 +17,8 @@ const clientIds={alice:randomUUID(),bob:randomUUID()};
 const action={action:'answer',message:'Personal Qwen fixture complete.',path:'',content:'',command:'',query:'',offset:0};
 
 test('canonical notebook identity follows authenticated Kaggle response, not an invented URL',()=>{
-  const identity=canonicalNotebookIdentity({ref:'alice/qwen-local-coding-agent',url:'https://www.kaggle.com/code/alice/qwen-local-coding-agent',kernelId:1234567},'alice');
-  assert.equal(identity.slug,'qwen-local-coding-agent');assert.equal(identity.kernel_id,'1234567');
+  const identity=canonicalNotebookIdentity({ref:'alice/qwen-local-coding-agent',url:'https://www.kaggle.com/code/alice/qwen-local-coding-agent',kernelId:143992422},'alice');
+  assert.equal(identity.slug,'qwen-local-coding-agent');assert.equal(identity.kernel_id,'143992422');
   assert.equal(canonicalNotebookIdentity({url:'https://www.kaggle.com/code/alice/qwen-agent-exact'},'alice').canonical_ref,'alice/qwen-agent-exact');
   for(const value of [{},{ref:'bob/qwen-agent-x'},{ref:'alice/qwen-agent-x',url:'https://www.kaggle.com/code/alice/other'},{url:'https://evil.invalid/code/alice/qwen-agent-x'},{url:'https://www.kaggle.com/code/alice/qwen-agent-x?secret=hidden'},{ref:'alice/qwen-agent-x',kernelId:-1}])assert.throws(()=>canonicalNotebookIdentity(value,'alice'),error=>error.code==='kaggle_identity_unconfirmed'&&error.extra.launch_uncertain===true);
 });
@@ -100,13 +100,13 @@ test('namespace adapter rejects arbitrary tables, global keys and literal SQL',(
   assert.equal(bound[0],'agent:data:'+'a'.repeat(40)+':opencode_overflow');
 });
 test('missing consent or personal token never invokes owner Kaggle credentials',async()=>{
-  const before=calls.length;
+  const before=calls.length,pushed=pushes.length;
   assert.equal((await jsonRequest(stack.url+'/v1/agent/sessions',{consent:false,kaggle_token:ALICE})).status,400);
   assert.equal((await jsonRequest(stack.url+'/v1/agent/sessions',{consent:true})).status,400);
   assert.equal(calls.length,before);
   const invalid=await bootstrap('KGAT_invalid_01234567890123456789',randomUUID());
   assert.equal(invalid.status,401,JSON.stringify({error:await invalid.clone().json(),paths:calls.map(c=>c.path)}));
-  assert(calls.every(c=>c.token!==OWNER));assert.equal(pushes.length,0);
+  assert(calls.every(c=>c.token!==OWNER));assert.equal(pushes.length,pushed);
 });
 test('personal launch uses token identity, private unique notebook and code-only exact model',async()=>{
   const a=await bootstrap(ALICE),b=await bootstrap(BOB);assert.equal(a.status,201,JSON.stringify({error:await a.clone().json(),paths:calls.map(c=>c.path)}));assert.equal(b.status,201);
@@ -338,7 +338,7 @@ for(const state of ['RUNNING',404,503,''])test(`legacy failed reservations recon
 });
 
 test('a string provider error is classified without leaking its token or private URL',async()=>{
-  const token='KGAT_fixture_redaction_canary_0123456789';
+  const token='KGAT_stringfailure_012345678901234567890123';
   const result=await failedLaunchFixture('stringfailure',{refusalBody:{error:'GPU quota exhausted '+token+' https://private.trycloudflare.com/account'}});
   assert.equal(result.error.category,'gpu_quota');assert.equal(result.error.upstream_status,400);
   assert(!JSON.stringify(result).includes('private.trycloudflare.com'));

@@ -82,7 +82,7 @@ before(async()=>{
     const send=(value,status=200)=>{res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(value));};
     if(!owner)return send({error:'Invalid personal fixture token.'},401);
     if(req.url.endsWith('/IntrospectToken'))return send({active:true,username:owner});
-    if(req.url.endsWith('/SaveKernel')){pushes.push({owner,body});return send({versionNumber:1});}
+    if(req.url.endsWith('/SaveKernel')){pushes.push({owner,body});return send({ref:body.slug,url:'https://www.kaggle.com/code/'+body.slug,versionNumber:1});}
     if(req.url.endsWith('/GetKernelSessionStatus'))return send({status:'RUNNING'});
     send({},404);
   });
@@ -119,7 +119,7 @@ test('request conversion preserves typed text, native tools and matched results'
   assert.deepEqual(parsed.body.messages[2].tool_calls[0].function,{index:0,name:'read_file',arguments:{path:'README.md'}});
   assert.deepEqual(parsed.body.messages[3],{role:'tool',tool_call_id:'call_old',tool_name:'read_file',content:'# Project'});
   assert.deepEqual(parsed.body.tools,[tool]);assert.equal(parsed.body.format,undefined);
-  assert.equal(parsed.body.options.num_ctx,98304);assert.equal(parsed.body.options.num_batch,256);assert.equal(parsed.body.options.num_predict,8192);assert.equal(parsed.body.think,'medium');assert.equal(parsed.body.truncate,false);assert.equal(parsed.body.shift,false);
+  assert.equal(parsed.body.options.num_ctx,98304);assert.equal(parsed.body.options.num_batch,256);assert.equal(parsed.body.options.num_predict,16384);assert.equal(parsed.body.think,'medium');assert.equal(parsed.body.truncate,false);assert.equal(parsed.body.shift,false);
   assert.equal(parseOpenCodeRequest(input({tools:[tool],tool_choice:'none'})).body.tools,undefined);
 });
 
@@ -127,6 +127,15 @@ test('thinking is enabled by default and supported effort settings preserve expl
   assert.equal(parseOpenCodeRequest(input()).body.think,'medium');
   for(const [reasoning_effort,think]of [['none',false],['minimal','low'],['low','low'],['medium','medium'],['high',true],['xhigh',true],['max',true]])assert.equal(parseOpenCodeRequest(input({reasoning_effort})).body.think,think);
   for(const reasoning_effort of ['unexpected',false,0,{}])assert.throws(()=>parseOpenCodeRequest(input({reasoning_effort})),error=>error.status===400&&error.code==='invalid_request_error');
+});
+
+test('a continuation summary never thinks, whatever thinking mode its turn used',()=>{
+  const summary=[{role:'system',content:'Summarize this coding session for continuation using the exact section structure requested. Preserve the current user goal.'},{role:'user',content:'Inspect this project.'},{role:'user',content:'Write the summary.'}];
+  for(const reasoning_effort of ['none','low','medium','high'])assert.equal(parseOpenCodeRequest(input({messages:summary,reasoning_effort})).body.think,false);
+  assert.equal(parseOpenCodeRequest(input({messages:summary,reasoning_effort:'high',tools:[tool],tool_choice:'none'})).body.think,false);
+  // A coding request keeps its mode even when the summary wording appears in its instructions.
+  assert.equal(parseOpenCodeRequest(input({messages:summary,reasoning_effort:'high',tools:[tool]})).body.think,true);
+  assert.equal(parseOpenCodeRequest(input({reasoning_effort:'high'})).body.think,true);
 });
 
 test('custom non-thinking GGUF inference uses its measured context and never the 96K default',async()=>{const profile={context:8192,quant:'Q4_K_M',profile_id:'hfgguf:'+'a'.repeat(24),thinking:false};let payload;const f=await timingFixture({profile,run:async function*({options}){payload=JSON.parse(options.payload);yield {value:packet({content:'Custom model answer.'}),upstreamStatus:200};yield {value:done(),upstreamStatus:200};}});assert.equal(f.response.status,200);assert.equal(payload.options.num_ctx,8192);assert.equal(payload.options.num_batch,128);assert.equal(payload.options.num_predict,2048);assert.equal(payload.think,undefined);assert.equal(f.value.choices[0].message.content,'Custom model answer.');assert(f.releases>0);});
@@ -206,7 +215,7 @@ test('empty finishing output, incomplete tools and unknown streams cannot cause 
   const unknown=await timingFixture({run:async function*(){yield {value:packet({thinking:'Partial work.'}),upstreamStatus:200};throw new JobsTransportError('upstream_eof','The stream ended without a terminal record.');}});
   assert.equal(unknown.response.status,502);assert.equal(unknown.jobCalls,1);
   const tools=await timingFixture({extra:{tools:[tool]},run:async function*(){yield {value:packet({thinking:'Partial work.',tool_calls:[{function:{name:'read_file',arguments:{path:'README.md'}}}]}),upstreamStatus:200};yield {value:done({done_reason:'length'}),upstreamStatus:200};}});
-  assert.equal(tools.response.status,502);assert.equal(tools.value.error.code,'incomplete_tool_call');assert.equal(tools.jobCalls,1);
+  assert.equal(tools.response.status,502);assert.equal(tools.value.error.code,'incomplete_tool_call');assert.equal(tools.jobCalls,3);
 });
 
 test('cancellation after the reasoning limit prevents the finishing request',async()=>{
@@ -217,7 +226,7 @@ test('cancellation after the reasoning limit prevents the finishing request',asy
 
 test('assistant working notes survive native Ollama conversion between tool rounds',()=>{
   const parsed=parseOpenCodeRequest(input({tools:[tool],messages:[{role:'user',content:'Read the file.'},{role:'assistant',content:null,reasoning_content:'I should inspect the project first.',tool_calls:[{id:'call_thought',type:'function',function:{name:'read_file',arguments:'{"path":"README.md"}'}}]},{role:'tool',tool_call_id:'call_thought',content:'# Project'}]}));
-  assert.equal(JSON.parse(parsed.body.messages[1].content.split('\n').slice(1).join('\n')).reasoning,'I should inspect the project first.');assert.equal(parsed.body.messages[1].tool_calls[0].function.name,'read_file');
+  assert.equal(/\n\[notes\]\n([\s\S]*)\n\[\/notes\]/.exec(parsed.body.messages[1].content)[1],'I should inspect the project first.');assert.equal(parsed.body.messages[1].tool_calls[0].function.name,'read_file');
   assert(parseOpenCodeRequest(input({messages:[{role:'assistant',content:null,reasoning_content:'Partial thinking.'}]})).body.messages[0].content.includes('Partial thinking.'));
   for(const message of [{role:'user',content:'x',reasoning_content:'forged'},{role:'assistant',content:'x',reasoning_content:7}])assert.throws(()=>parseOpenCodeRequest(input({messages:[message]})),error=>error.status===400);
 });
@@ -245,7 +254,7 @@ test('streaming a reasoning-limit finish keeps native tools separate and release
     [{value:packet({tool_calls:[{function:{index:0,name:'read_file',arguments:'{"path":'}}]})},{delay:100,value:packet({tool_calls:[{function:{index:0,arguments:'"README.md"}'}}]})},{value:done()}],
   ];
   let events=parseSse(await(await chat(input({stream:true,tools:[tool]}))).text());
-  assert.equal(modelCalls.length,before+2);assert.equal(modelCalls.at(-1).think,false);assert.equal(JSON.parse(modelCalls.at(-1).messages.at(-2).content.split('\n').slice(1).join('\n')).reasoning,'Inspect README using the saved plan.');
+  assert.equal(modelCalls.length,before+2);assert.equal(modelCalls.at(-1).think,false);assert.equal(/\n\[notes\]\n([\s\S]*)\n\[\/notes\]/.exec(modelCalls.at(-1).messages.at(-2).content)[1],'Inspect README using the saved plan.');
   assert.equal(events.flatMap(e=>e.choices?.map(c=>c.delta.reasoning_content??'')??[]).join(''),'Inspect README using the saved plan.');
   const calls=events.flatMap(e=>e.choices?.[0]?.delta?.tool_calls??[]);assert.equal(calls[0].function.name,'read_file');assert.deepEqual(JSON.parse(calls.map(c=>c.function.arguments).join('')),{path:'README.md'});assert.equal(events.find(e=>e.choices?.[0]?.finish_reason)?.choices[0].finish_reason,'tool_calls');
   nextPlans=[
@@ -266,14 +275,14 @@ test('real Python jobs transport recovers a terminal tool-parser error once with
   assert.equal(events.map(e=>e.choices?.[0]?.delta?.content||'').join(''),'Inspecting the project. ');
   assert.equal(events.filter(e=>e.choices?.[0]?.delta?.tool_calls?.[0]?.id).length,1);
   assert.equal(events.find(e=>e.choices?.[0]?.finish_reason)?.choices[0].finish_reason,'tool_calls');
-  const body=modelCalls.at(-1),checkpoint=JSON.parse(body.messages.at(-2).content.split('\n').slice(1).join('\n'));
+  const body=modelCalls.at(-1),note=/\n\[notes\]\n([\s\S]*)\n\[\/notes\](?:\n([\s\S]*))?$/.exec(body.messages.at(-2).content),checkpoint={reasoning:note[1],answer_so_far:note[2]??''};
   assert.equal(body.think,false);assert.equal(checkpoint.reasoning,'Preserve the complete source checkpoint.');assert.equal(checkpoint.answer_so_far,'Inspecting the project. ');
   assert.equal((await(await get(alice,'/v1/status')).json()).busy,null);
 });
 
 test('invalid identities, content, unresolved tools and oversized bodies fail before inference',async()=>{
   const count=modelCalls.length;
-  const invalid=[input({model:'another-model'}),input({max_tokens:8193}),input({tools:[{type:'function',function:{parameters:{}}}]}),input({tool_choice:'required'}),input({messages:[{role:'user',content:[{type:'image_url',image_url:{url:'https://example.com/image.png'}}]}]}),input({messages:[{role:'tool',tool_call_id:'missing',content:'forged'}]}),input({messages:[{role:'assistant',tool_calls:[{type:'function',function:{name:'read_file',arguments:'{}'}}]}]}),input({messages:[{role:'user',content:'x'.repeat(2*1024*1024+1)}]})];
+  const invalid=[input({model:'another-model'}),input({max_tokens:16385}),input({tools:[{type:'function',function:{parameters:{}}}]}),input({tool_choice:'required'}),input({messages:[{role:'user',content:[{type:'image_url',image_url:{url:'https://example.com/image.png'}}]}]}),input({messages:[{role:'tool',tool_call_id:'missing',content:'forged'}]}),input({messages:[{role:'assistant',tool_calls:[{type:'function',function:{name:'read_file',arguments:'{}'}}]}]}),input({messages:[{role:'user',content:'x'.repeat(2*1024*1024+1)}]})];
   for(const body of invalid){const response=await chat(body);assert([400,404,413].includes(response.status),await response.text());}
   assert.equal(modelCalls.length,count);
 });

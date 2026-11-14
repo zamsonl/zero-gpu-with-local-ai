@@ -294,6 +294,7 @@ function pauseUntilPoll(ms,signal){
 export async function waitForOwnReady(session,{signal,log=console.log,onProgress,probeNotebook,onReady,request=ownCloudRequest,pause=pauseUntilPoll,now=Date.now,timeoutMs=OPEN_CODE_REQUEST_TIMEOUT_MS,pollMs=5000}={}){
   const start=now(),secrets=[session?.key];let reported='',lastReport=0,lastBootAt=-Infinity,lastLogPoll=-Infinity,lastQueueProbe=-Infinity,queueResult=null,queueDiagnostic='';
   let current={stage:'connecting',detail:'Waiting for the notebook to report its startup stage.'};const seenLines=new Set();
+  const silenceNotes=[5,15,30];
   const elapsed=()=>Math.floor(Math.max(0,now()-start)/1000);
   const publish=event=>emitSetupProgress(onProgress,{source:'notebook',...event,elapsedSeconds:elapsed()},secrets);
   const failure=(message,stage=current.stage)=>{
@@ -346,6 +347,12 @@ export async function waitForOwnReady(session,{signal,log=console.log,onProgress
       if(['ERROR','COMPLETE','CANCELED','CANCELLED','CANCEL_ACKNOWLEDGED'].includes(queueResult?.status))failure('Kaggle reports this notebook '+queueResult.status.toLowerCase()+'. Open its notebook logs to check quota, GPU availability or startup errors before retrying.');
       if(queueResult?.status==='QUEUED'&&(!status.boot||status.boot.stage==='queued'))current={stage:'queued',detail:'Kaggle confirmed this notebook is queued for GPUs. Model installation and loading have not started.'};
       else if(queueResult?.status==='RUNNING'&&(!status.boot||status.boot.stage==='queued'))current={stage:'connecting',detail:'Kaggle reports the notebook is running. Waiting for its first Python startup log; the model is not ready yet.'};
+    }
+    // A notebook that has started reports within about a minute. Say so when nothing
+    // has arrived, instead of leaving one unchanged line on screen for the whole wait.
+    if(status?.server==='starting'&&(!status.boot||status.boot.stage==='queued')&&silenceNotes.length&&now()-start>=silenceNotes[0]*60000){
+      const note='No startup report after '+silenceNotes.shift()+' minutes. A notebook that has started reports within about a minute, so Kaggle has most likely not given it a GPU yet ('+(queueResult?.status?'Kaggle status: '+queueResult.status.toLowerCase():'Kaggle has not returned a status for it')+'). Check your weekly GPU quota on Kaggle, stop any older notebook that is still running, and open this notebook on Kaggle to see its state. Cancel setup to stop waiting.';
+      publish({...current,state:'running',line:note,connection});if(!onProgress)log(note);
     }
     const event={...current,state:'running',connection};
     publish(event);
@@ -576,6 +583,7 @@ async function launchOpenCodeInner(args,dependencies,context){
     if(cancelled()){await close();return null;}
     log('OpenCode · '+folder+'\nYour Kaggle account: '+session.owner+'\nYour notebook: '+session.url);
     log((session.model_profile?session.model_profile.label+' · '+session.model_profile.context.toLocaleString()+' context':'Qwen only · 98,304 context')+' · '+(session.model_profile?.thinking===false?'This model does not advertise thinking.':'Reasoning is enabled and expanded by default. Use /thinking to collapse or expand it.'));
+    if(session.model_profile?.thinking!==false)log('Thinking modes: press Ctrl+T (or type /variants) to switch between fast (no thinking), light, normal and deep. With none chosen Qwen uses normal.');
     log('Automatic context compaction uses the same hosted model and continues from saved session notes. Original local history remains saved.');
     log('Edits, shell commands and browser actions ask for approval. Exit OpenCode or press Ctrl+C to request notebook shutdown.');
     log('The connector keeps your personal notebook online while this window is open. Requests may run for up to two hours; Kaggle runtime and quota limits still apply.');

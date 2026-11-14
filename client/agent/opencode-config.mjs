@@ -18,6 +18,9 @@ export const OPEN_CODE_REQUEST_TIMEOUT_MS=2*60*60*1000;
 // client timeout; this grace never extends the model's shared request deadline.
 export const OPEN_CODE_TRANSPORT_TIMEOUT_MS=OPEN_CODE_REQUEST_TIMEOUT_MS+30_000;
 const THINKING_VISIBILITY_VERSION=1;
+// Thinking modes offered inside OpenCode (Ctrl+T cycles them, /variants lists them).
+// Each is a reasoning effort for the gateway; with no mode chosen Qwen runs as normal.
+export const THINKING_MODES={fast:'none',light:'low',normal:'medium',deep:'high'};
 
 export function credentialRules(defaultAction='allow',extraPaths=[]){
   const rules={'*':defaultAction};
@@ -32,7 +35,7 @@ export function credentialRules(defaultAction='allow',extraPaths=[]){
 
 export function createOpenCodeConfig(session,{browserCommand,privatePaths=[]}={}){
   const own=validatePersonalSession(session,{requireFresh:false});
-  const profile=own.model_profile,capacity=profile?.context||98304,custom=!!profile;
+  const profile=own.model_profile,capacity=profile?.context||98304,custom=!!profile,thinks=custom?profile.thinking===true:true;
   const permission={
     '*':'ask',read:credentialRules('allow',privatePaths),edit:credentialRules('ask',privatePaths),
     write:'ask',patch:'ask',bash:'ask',glob:'allow',grep:'ask',
@@ -47,7 +50,7 @@ export function createOpenCodeConfig(session,{browserCommand,privatePaths=[]}={}
   // Short metadata and compaction outputs need their budget for the actual
   // title/notes. Interactive coding agents retain the model's Balanced effort.
   for(const name of ['title','summary','compaction'])agent[name].reasoningEffort='none';
-  agent.compaction.prompt='Summarize this coding session for continuation using the exact section structure requested. Preserve the current user goal, explicit constraints, later corrections, exact file paths and identifiers, changes made, commands and test results, unresolved errors, and concrete next steps. Distinguish verified facts from tentative assistant suggestions. Keep important numerical values and the latest request exact. Do not invent progress or reproduce credentials. Do not continue the task inside the summary.';
+  agent.compaction.prompt='Summarize this coding session for continuation using the exact section structure requested. Preserve the current user goal, explicit constraints, later corrections, exact file paths and identifiers, changes made, commands and test results, unresolved errors, and concrete next steps. Distinguish verified facts from tentative assistant suggestions. Keep important numerical values and the latest request exact. List every step already completed and every file already read with what was learned, so that work is not repeated after this summary, and end with the single next action to take. Do not invent progress or reproduce credentials. Do not continue the task inside the summary.';
   agent.plan.permission={edit:'deny',write:'deny',patch:'deny',bash:'ask'};
   agent.explore.permission={edit:'deny',write:'deny',patch:'deny',bash:'ask'};
   return {
@@ -60,9 +63,10 @@ export function createOpenCodeConfig(session,{browserCommand,privatePaths=[]}={}
       npm:'@ai-sdk/openai-compatible',name:custom?'Your private Kaggle model':'Your private Kaggle Qwen',
       options:{baseURL:own.relay+'/v1',apiKey:'{env:'+RELAY_KEY_ENV+'}',timeout:OPEN_CODE_TRANSPORT_TIMEOUT_MS},
       models:{[MODEL_ID]:{
-        name:profile?.label||'Qwen 27B · your Kaggle GPU',tool_call:true,attachment:false,reasoning:custom?profile.thinking===true:true,
+        name:profile?.label||'Qwen 27B · your Kaggle GPU',tool_call:true,attachment:false,reasoning:thinks,
         interleaved:{field:'reasoning_content'},options:{reasoningEffort:'medium'},
-        modalities:{input:['text'],output:['text']},limit:{context:capacity,input:capacity,output:custom?Math.min(4096,Math.floor(capacity/4)):8192},
+        ...(thinks?{variants:Object.fromEntries(Object.entries(THINKING_MODES).map(([mode,reasoningEffort])=>[mode,{reasoningEffort}]))}:{}),
+        modalities:{input:['text'],output:['text']},limit:{context:capacity,input:capacity,output:custom?Math.min(4096,Math.floor(capacity/4)):16384},
         cost:{input:0,output:0},
       }},
     }},

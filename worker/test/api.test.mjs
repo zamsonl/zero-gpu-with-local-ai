@@ -25,7 +25,7 @@ const KEYED = { port: 8801, mockPort: 11501, state: ".test-state/api-key", auth:
 const CSP =
   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; " +
   "font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
-const THINK_OPTIONS = { num_ctx: 24576, temperature: 1.0, top_p: 0.95, top_k: 20, num_predict: 2048 };
+const THINK_OPTIONS = { num_ctx: 24576, temperature: 1.0, top_p: 0.95, top_k: 20, num_predict: 10240 };
 // Base64 of the first bytes of a JPEG: the mock never decodes pictures, it only records them.
 const TINY_JPEG = "/9j/4AAQSkZJRgABAQ==";
 const FAST_OPTIONS ={ num_ctx: 24576, temperature: 0.7, top_p: 0.8, top_k: 20, presence_penalty: 1.5, num_predict: 4096 };
@@ -1016,7 +1016,7 @@ describe("open stack", () => {
       const quick = await turn(open, chat.id, { content: "a quick one", think: "low" });
       assert.equal(kinds(quick.events).at(-1), "done");
       assert.equal(open.mock.lastChat().think, "low");
-      assert.equal(open.mock.lastChat().options.num_predict, 2048, "the selected effort uses a bounded work window");
+      assert.equal(open.mock.lastChat().options.num_predict, 10240, "the selected effort keeps its full reply budget");
       assertApiError(await callTurn(turn(open, chat.id, { content: "nope", think: "xhigh" })), 400, "bad_request");
       await waitForLockRelease(open);
     });

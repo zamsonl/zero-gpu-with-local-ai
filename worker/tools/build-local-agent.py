@@ -12,9 +12,14 @@ files += ['setup.mjs', 'folder-picker.mjs', 'terminal-host.mjs', 'Start Qwen Set
 files += ['cache.mjs']
 files += ['deployment.mjs', 'deployment.json']
 destination.parent.mkdir(parents=True, exist_ok=True)
+# The extracted folder shows one launcher; every working file sits in app/.
+launcher = b'@echo off\r\ncall "%~dp0app\\Start Qwen OpenCode.cmd" %*\r\n'
 with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
+    top = zipfile.ZipInfo('qwen-local-agent/Start Qwen OpenCode.cmd', date_time=(2026,11,5,0,0,0))
+    top.compress_type = zipfile.ZIP_DEFLATED
+    archive.writestr(top, launcher)
     for name in files:
-        info = zipfile.ZipInfo('qwen-local-agent/' + name, date_time=(2026,11,5,0,0,0))
+        info = zipfile.ZipInfo('qwen-local-agent/app/' + name, date_time=(2026,11,5,0,0,0))
         info.compress_type = zipfile.ZIP_DEFLATED
         file = source / name
         if name == 'deployment.json' and '--public' not in sys.argv and (source / 'deployment.local.json').is_file():

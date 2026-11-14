@@ -80,7 +80,7 @@ test('three exact repeated reasoning windows are preserved before one announced 
 test('proactive thinking windows cap only each job while preserving full context and the logical reply reservation',async()=>{
   await call('PUT','/v1/settings',{max_reply_tokens:null});const id=await create('recover-proactive');stack.mock.configure({thinkingTokens:4200});
   const result=await call('POST',`/v1/chats/${id}/turn`,{content:'Keep working until the result is ready.',think:true});const done=finalEvent(result);
-  assert.equal(done.event,'done');assert(done.message.content);assert.equal(stack.mock.lastChat().options.num_predict,2048);assert.equal(stack.mock.lastChat().options.num_ctx,24576);assert.equal(done.message.stats.context.reserved_reply_tokens,10240);assert.equal(done.message.stats.work_window_tokens,2048);assert.equal(stack.mock.lastGenerate().think,true);
+  assert.equal(done.event,'done');assert(done.message.content);assert.equal(stack.mock.lastChat().options.num_predict,10240);assert.equal(stack.mock.lastChat().options.num_ctx,24576);assert.equal(done.message.stats.context.reserved_reply_tokens,10240);assert.equal(done.message.stats.work_window_tokens,10240);/* 4,200 thinking tokens finish in one continuous reply: no summarise-and-restart pass */assert.equal(done.message.stats.recovery,undefined);
 });
 
 test('the registered98304 context and batch256 remain unchanged across proactive work windows',async()=>{
@@ -90,7 +90,7 @@ test('the registered98304 context and batch256 remain unchanged across proactive
     await call('PUT','/v1/settings',{max_reply_tokens:null});const id=await create('recover-full-profile');stack.mock.configure({thinkingTokens:4200});
     const done=finalEvent(await call('POST',`/v1/chats/${id}/turn`,{content:'Keep the registered full model profile and answer.',think:'medium'}));
     assert.equal(done.event,'done');assert.equal(done.message.stats.context.capacity_tokens,98304);assert.equal(done.message.stats.context.reserved_reply_tokens,24576);assert.equal(done.message.stats.num_batch,256);assert.equal(done.message.stats.think,'medium');
-    const requests=stack.mock.requests();assert(requests.every(({body})=>body.options.num_ctx===98304&&body.options.num_batch===256));assert(requests.filter(({body})=>!body.format).every(({body})=>body.options.num_predict===2048&&body.think==='medium'));assert.equal(new Set(requests.map(({body})=>body.model)).size,1);
+    const requests=stack.mock.requests();assert(requests.every(({body})=>body.options.num_ctx===98304&&body.options.num_batch===256));assert(requests.filter(({body})=>!body.format).every(({body})=>body.options.num_predict===24576&&body.think==='medium'));assert.equal(new Set(requests.map(({body})=>body.model)).size,1);
   }finally{await register(24576);}
 });
 

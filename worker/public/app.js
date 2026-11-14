@@ -24,6 +24,8 @@ import { SessionRail } from "./js/session-rail.js";
 import { formatProgressStatus } from "./js/progress-status.js";
 
 const NEAR_BOTTOM_PX = 120;
+const RESUME_FOLLOW_PX = 8;
+let lastScrollTop = 0;
 const MAX_AUTOMATIC_CONTINUES = 8;
 const MAX_AUTOMATIC_WORK_MS = 12 * 60 * 1000;
 // Preserve an idempotency identity when an upload's acknowledgement is lost.
@@ -144,6 +146,13 @@ els.chatMenu.addEventListener("click", () => state.chat && sidebar.openChatMenu(
 els.jump.prepend(icon("arrowDown"));
 els.jump.addEventListener("click", () => scrollToBottom(true));
 els.conversation.addEventListener("scroll", onScroll, { passive: true });
+// The wheel and keys say what the reader wants before the next streamed frame can pull them back.
+els.conversation.addEventListener("wheel", (event) => {
+  if (event.deltaY < 0 && els.conversation.scrollTop > 0) state.stickToBottom = false;
+}, { passive: true });
+els.conversation.addEventListener("keydown", (event) => {
+  if (["ArrowUp", "PageUp", "Home"].includes(event.key) && !event.target?.closest?.("textarea, input, [contenteditable]")) state.stickToBottom = false;
+});
 // The conversation scrolls under the floating header and composer; keep its padding in step.
 new ResizeObserver(() => document.documentElement.style.setProperty("--dock-h", `${els.dock.offsetHeight}px`)).observe(els.dock);
 els.thread.addEventListener("grew", () => {
@@ -1258,7 +1267,13 @@ async function deleteChat(chat) {
 function onScroll() {
   const el = els.conversation;
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-  state.stickToBottom = distance < NEAR_BOTTOM_PX;
+  // Following only ever moves down, so any upward move is the reader's. Let go at once and
+  // take hold again only at the real bottom; a 120px zone snapped a slow scroll back each frame.
+  const up = el.scrollTop < lastScrollTop - 1 && distance > 1;
+  lastScrollTop = el.scrollTop;
+  if (up) state.stickToBottom = false;
+  else if (distance < RESUME_FOLLOW_PX) state.stickToBottom = true;
+  else if (!state.generation) state.stickToBottom = distance < NEAR_BOTTOM_PX;
   els.main.classList.toggle("is-scrolled", el.scrollTop > 2);
   els.main.classList.toggle("has-more", distance > 2);
   if (state.stickToBottom) els.jump.hidden = true;

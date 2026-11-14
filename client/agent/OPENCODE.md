@@ -29,6 +29,17 @@ Review any tool approval before accepting it. The configured model is `personal-
 
 ## Visible thinking and long work
 
+**Thinking modes.** Press **Ctrl+T** inside OpenCode to cycle the mode, or type `/variants` to pick one from a list.
+
+| Mode | What Qwen does | Use it for |
+|---|---|---|
+| `fast` | Answers and uses tools without thinking first | Simple edits, quick questions |
+| `light` | A brief think first | Small, clear tasks |
+| `normal` | Thinks as much as the task needs (the default when no mode is chosen) | Everyday coding |
+| `deep` | Checks its work and weighs alternatives; slowest | Hard bugs, design decisions |
+
+The mode applies from your next message and can be changed at any time. Session summaries written during automatic compaction never think, whatever the mode, so the summary always has room to finish.
+
 The coding agents use **Balanced reasoning** by default. Qwen's reasoning is streamed separately from the answer and tool calls, so it appears as OpenCode thinking blocks. This update expands thinking once in each isolated Qwen project/account profile; a later explicit collapse is remembered. Use **`/thinking`** to collapse or expand it. That command changes display only. Short title, summary and compaction helpers still use the same Qwen, with thinking off so their output budget goes to the actual title or saved notes.
 
 **Automatic context compaction is enabled.** Before the 98,304-token window fills, OpenCode asks the same Qwen to summarize the session and then continues automatically. The prompt preserves your current goal, constraints and corrections, exact file paths, changes, test results, unresolved errors and next steps. The latest two turns are kept verbatim when they fit the 16,384-token recent-history budget; older tool history is not aggressively pruned. OpenCode still shortens each older tool result to 2,000 characters in the summary request, so important details in an omitted suffix may need to be read again from the project or original local session. The profile reserves 12,288 tokens for reply and protocol overhead and allows up to 8,192 output tokens per model turn. Compaction extends a conversation across turns; it cannot make one uninterrupted thinking pass infinite or guarantee perfect recall. Original local history remains saved, so important details can be reviewed. Large tool results can still require another compaction or a smaller targeted read.

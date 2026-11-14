@@ -48,9 +48,10 @@ async function fixture({run,extra={},signal,profile}={}){
   return {response,value,events,calls,timers,releases,state,elapsed:now};
 }
 
+const readNote=text=>{const m=/^[^\n]*\n\[notes\]\n([\s\S]*)\n\[\/notes\](?:\n([\s\S]*))?$/.exec(text);if(!m)throw new Error('Not a working-notes message.');return {reasoning:m[1],answer_so_far:m[2]??''};};
 const checkpoints=body=>body.messages
   .filter(message=>message.role==='assistant'&&message.content?.startsWith('Unfinished working notes from this response.'))
-  .map(message=>JSON.parse(message.content.slice(message.content.indexOf('\n')+1)));
+  .map(message=>readNote(message.content));
 
 test('reasoning-limit finish retains the complete checkpoint even when native Ollama drops Thinking',async()=>{
   const saved='Verified source: C:\\project\\auth.ts. Keep the explicit user requirement. '+ 'Important checkpoint αβ '.repeat(100);let budget;
@@ -77,7 +78,10 @@ test('recognized runner and tool-parser failures recover once with saved text un
       const body=JSON.parse(options.payload);
       if(call===1){budget=options.requestBudget;advance(42*60_000);yield {value:packet({thinking:saved}),upstreamStatus:200};yield {value:{error},upstreamStatus:200};return;}
       assert.equal(call,2);assert.equal(options.requestBudget,budget);assert.equal(options.maxJobMs,78*60_000);
-      assert.equal(body.think,false);assert.equal(body.options.temperature,0);assert(body.options.num_predict<=4096);
+      // A cut-off tool call is retried with the whole reply budget and a smaller piece to write.
+      assert.equal(body.think,false);assert.equal(body.options.temperature,0);
+      if(error===parserError){assert.equal(body.options.num_predict,16384);assert.match(body.messages.at(-1).content,/at most about 150 lines/);}
+      else assert(body.options.num_predict<=4096);
       assert(checkpoints(body).some(note=>note.reasoning===saved));assert.deepEqual(body.tools,[tool]);
       assert(!body.messages.some(message=>message.tool_calls),'A failed tool call must not be replayed into the checkpoint');
       yield {value:packet({content:'Continued safely.'}),upstreamStatus:200};yield {value:done(),upstreamStatus:200};
@@ -102,13 +106,15 @@ test('a main reasoning finish followed by one recognized recovery has at most th
   assert.equal(f.value.usage.prompt_tokens,78400);assert.equal(f.value.usage.completion_tokens,8222);assert.equal(f.timers.size,0);
 });
 
-test('recognized repeated model failures stop after one recovery and expose the correct cause',async()=>{
-  for(const [error,code]of [[runnerError,'model_runner_stopped'],[parserError,'model_tool_parse_error'],['CUDA out of memory while allocating a device buffer','model_out_of_memory']]){
-    const f=await fixture({run:async function*({call}){
-      assert(call<=2,'Model recovery cannot form an automatic retry loop');yield {value:packet({thinking:'Useful checkpoint.'}),upstreamStatus:200};yield {value:{error},upstreamStatus:500};
+test('recognized repeated model failures stop after a bounded recovery and expose the correct cause',async()=>{
+  for(const [error,code,jobs]of [[runnerError,'model_runner_stopped',2],[parserError,'model_tool_parse_error',3],['CUDA out of memory while allocating a device buffer','model_out_of_memory',1]]){
+    const f=await fixture({run:async function*({call,options}){
+      assert(call<=jobs,'Model recovery cannot form an automatic retry loop');
+      if(code==='model_tool_parse_error'&&call===3)assert.match(JSON.parse(options.payload).messages.at(-1).content,/at most about 60 lines/);
+      yield {value:packet({thinking:'Useful checkpoint.'}),upstreamStatus:200};yield {value:{error},upstreamStatus:500};
     }});
-    assert.equal(f.response.status,502);assert.equal(f.value.error.code,code);assert(f.calls.length<=2);assert.equal(f.timers.size,0);
-    if(code!=='model_out_of_memory')assert.equal(f.calls.length,2);
+    assert.equal(f.response.status,502);assert.equal(f.value.error.code,code);assert.equal(f.calls.length,jobs);assert.equal(f.timers.size,0);
+    if(code==='model_tool_parse_error')assert.match(f.value.error.message,/smaller parts/);
   }
 });
 
@@ -151,12 +157,14 @@ test('unchanged cross-step tool loops stop before any executable delta and canno
 });
 
 test('tool calls held before a model failure are never executed, streamed or copied into a retry',async()=>{
-  const f=await fixture({extra:{stream:true,tools:[tool]},run:async function*({call}){
-    assert.equal(call,1,'A response with a withheld tool call must not be replayed');
+  const f=await fixture({extra:{stream:true,tools:[tool]},run:async function*({call,options}){
+    assert(call<=3,'Tool-call retries are bounded');
+    // The retry is a fresh generation from notes; the failed call itself is never carried over.
+    assert(!JSON.parse(options.payload).messages.some(message=>message.tool_calls),'A withheld tool call must not be copied into a retry');
     yield {value:packet({thinking:'Inspecting.',tool_calls:[{function:{index:0,name:'read_file',arguments:'{"path":"README.md"}'}}]}),upstreamStatus:200};
     yield {value:{error:parserError},upstreamStatus:200};
   }});
-  assert.equal(f.calls.length,1);assert(f.events.some(event=>event.error));
+  assert.equal(f.calls.length,3);assert(f.events.some(event=>event.error));
   assert(!f.events.some(event=>event.choices?.[0]?.delta?.tool_calls));assert(!f.events.some(event=>event.choices?.[0]?.finish_reason));
   assert.equal(f.events.find(event=>event.error)?.error.code,'model_tool_parse_error');assert.equal(f.timers.size,0);
 });
@@ -180,7 +188,7 @@ test('streamed recovery preserves text once and releases only a new terminal-suc
   assert.equal(f.events.map(event=>event.choices?.[0]?.delta?.content||'').join(''),'I will inspect the file. ');
   assert.equal(f.events.filter(event=>event.choices?.[0]?.delta?.tool_calls?.[0]?.id).length,1);
   assert.equal(f.events.find(event=>event.choices?.[0]?.finish_reason)?.choices[0].finish_reason,'tool_calls');
-  const checkpoint=JSON.parse(JSON.parse(f.calls[1].payload).messages.at(-2).content.split('\n').slice(1).join('\n'));
+  const checkpoint=readNote(JSON.parse(f.calls[1].payload).messages.at(-2).content);
   assert.equal(checkpoint.answer_so_far,'I will inspect the file. ');
 });
 
