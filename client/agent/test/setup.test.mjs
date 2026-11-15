@@ -121,3 +121,18 @@ test('continuing the last conversation is an explicit, remembered choice passed 
     await start({resume:'yes'});assert(!seen[3].args.includes('--continue'),'only an explicit true continues');
   }finally{await fs.rm(directory,{recursive:true,force:true});}
 });
+
+test('old notebooks are counted first and removed only on an explicit second request',async()=>{
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'qwen-setup-test-'));const seen=[],a='qwen-agent-'+'a'.repeat(24),b='qwen-agent-'+'b'.repeat(24),token='KGAT_cleanup_fixture_0123456789';
+  const local=await startSetupServer({controllerDependencies:{preferenceFile:path.join(directory,'prefs.json'),hasRememberedToken:async()=>true,loadSavedToken:async()=>token,
+    findOldNotebooks:async value=>{seen.push(['find',value.token]);return {owner:'alice',old:[a,b],kept:1};},removeOldNotebooks:async value=>{seen.push(['remove',value.token]);return {owner:'alice',removed:[a],failed:[b],kept:1};}}});
+  try{
+    const post=(body,capability=local.capability)=>fetch(local.origin+'/api/old-notebooks',{method:'POST',headers:{authorization:'Bearer '+capability,'content-type':'application/json'},body:JSON.stringify(body)});
+    assert.equal((await post({remove:true},'0'.repeat(64))).status,401);assert.equal(seen.length,0,'no Kaggle call without the private setup capability');
+    const counted=await(await post({})).json();assert.deepEqual(counted.oldNotebooks,{count:2,kept:1});assert.deepEqual(seen,[['find',token]]);
+    for(const body of [{remove:'true'},{remove:1},{confirm:true}]){await post(body);assert.equal(seen.at(-1)[0],'find','only an explicit remove:true deletes');}
+    const done=await(await post({remove:true})).json();assert.deepEqual(done.oldNotebooks,{removed:1,failed:1,kept:1});assert.deepEqual(seen.at(-1),['remove',token]);
+    assert(done.events.some(entry=>entry.text==='Removed 1 finished qwen-agent notebook older than one day from your Kaggle account. 1 could not be removed; try again later.'));
+    assert(!JSON.stringify(done).includes('KGAT_'),'the token never reaches the page');
+  }finally{await local.close();await fs.rm(directory,{recursive:true,force:true});}
+});

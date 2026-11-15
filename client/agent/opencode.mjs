@@ -292,7 +292,7 @@ function pauseUntilPoll(ms,signal){
 }
 
 // Every start submits a new private notebook, so finished ones collect in the account.
-export const NOTEBOOK_CLEANUP_HINT='Each start creates a new private notebook named qwen-agent-…; finished ones use no GPU time. Delete old ones on Kaggle under Your Work → Code when you no longer need them.';
+export const NOTEBOOK_CLEANUP_HINT='Each start creates a new private notebook named qwen-agent-…; finished ones use no GPU time. Remove old ones with Remove old notebooks in the setup window, or on Kaggle under Your Work → Code.';
 
 export async function waitForOwnReady(session,{signal,log=console.log,onProgress,probeNotebook,onReady,request=ownCloudRequest,pause=pauseUntilPoll,now=Date.now,timeoutMs=OPEN_CODE_REQUEST_TIMEOUT_MS,pollMs=5000}={}){
   const start=now(),secrets=[session?.key];let reported='',lastReport=0,lastBootAt=-Infinity,lastLogPoll=-Infinity,lastQueueProbe=-Infinity,queueResult=null,queueDiagnostic='';

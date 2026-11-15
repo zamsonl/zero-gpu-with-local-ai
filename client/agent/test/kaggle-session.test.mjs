@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {EventEmitter} from 'node:events';
-import {RELAY_ORIGIN,createOwnKaggleSession,requestOwnShutdown,validatePersonalSession,promptHiddenToken,readOwnGpuQuota,describeGpuQuota} from '../kaggle-session.mjs';
+import {RELAY_ORIGIN,createOwnKaggleSession,requestOwnShutdown,validatePersonalSession,promptHiddenToken,readOwnGpuQuota,describeGpuQuota,findOldAgentNotebooks,removeOldAgentNotebooks} from '../kaggle-session.mjs';
 import {launchAgent,parseOptions} from '../start.mjs';
 
 const TOKEN='KGAT_'+ 'dummy_personal_credential_1234567890';
@@ -137,4 +137,37 @@ test('GPU quota is read from Kaggle with the personal token only, and unreadable
   assert.equal((await readOwnGpuQuota({token,fetcher:async()=>Response.json({...answer,gpuQuota:{...answer.gpuQuota,timeUsed:'200000s'}})})).remainingSeconds,0);
   for(const fetcher of [async()=>{throw new Error('offline');},async()=>new Response('{}',{status:403}),async()=>new Response('not json'),async()=>Response.json({}),async()=>Response.json({gpuQuota:{timeUsed:'1s',totalTimeAllowed:'0s'}}),async()=>Response.json({gpuQuota:{timeUsed:'soon',totalTimeAllowed:'108000s'}})])
     assert.equal(await readOwnGpuQuota({token,fetcher}),null);
+});
+
+test('old-notebook cleanup removes only finished notebooks made by this helper and last run over a day ago',async()=>{
+  const token='KGAT_cleanup_fixture_0123456789',now=Date.parse('2026-11-16T12:00:00Z'),calls=[];
+  const id=letter=>'qwen-agent-'+letter.repeat(24);
+  const kernels=[
+    {ref:'alice/'+id('a'),lastRunTime:'2026-11-14T12:00:00Z'},          // old and finished: removed
+    {ref:'alice/'+id('b'),lastRunTime:'2026-11-16T03:00:00Z'},          // under a day old: kept
+    {ref:'alice/'+id('c'),lastRunTime:'2026-11-13T12:00:00Z'},          // old but still running: kept
+    {ref:'alice/'+id('d')},                                             // no run time: kept
+    {ref:'alice/my-own-analysis',lastRunTime:'2026-01-01T00:00:00Z'},   // not made by the helper
+    {ref:'alice/qwen-agent-notes',lastRunTime:'2026-01-01T00:00:00Z'},  // look-alike name
+    {ref:'bob/'+id('e'),lastRunTime:'2026-01-01T00:00:00Z'},            // another account
+    {ref:'alice/'+id('f'),lastRunTime:'2026-11-10T00:00:00Z'},          // old, status unreadable: kept
+    {ref:'alice/'+id('a')+'/extra',lastRunTime:'2026-01-01T00:00:00Z'}, // malformed reference
+  ];
+  const fetcher=async(url,options)=>{
+    const method=url.split('/').at(-1),body=JSON.parse(options.body);calls.push({method,body});
+    assert(url.startsWith('https://api.kaggle.com/v1/'));assert.equal(options.headers.authorization,'Bearer '+token);
+    if(method==='IntrospectToken')return Response.json({active:true,username:'alice'});
+    if(method==='ListKernels')return Response.json({kernels});
+    if(method==='GetKernelSessionStatus')return body.kernelSlug===id('c')?Response.json({status:'RUNNING'}):body.kernelSlug===id('f')?new Response('{}',{status:403}):Response.json({status:'complete'});
+    if(method==='DeleteKernel')return Response.json({});
+    throw new Error('unexpected Kaggle call '+method);
+  };
+  assert.deepEqual(await findOldAgentNotebooks({token,fetcher,now}),{owner:'alice',old:[id('a')],kept:4});
+  assert(!calls.some(call=>call.method==='DeleteKernel'),'finding never deletes');
+  assert.deepEqual(await removeOldAgentNotebooks({token,fetcher,now}),{owner:'alice',removed:[id('a')],failed:[],kept:4});
+  assert.deepEqual(calls.filter(call=>call.method==='DeleteKernel').map(call=>call.body),[{userName:'alice',kernelSlug:id('a')}]);
+  const refusing=async(url,options)=>url.endsWith('/DeleteKernel')?new Response('{}',{status:500}):fetcher(url,options);
+  assert.deepEqual(await removeOldAgentNotebooks({token,fetcher:refusing,now}),{owner:'alice',removed:[],failed:[id('a')],kept:4});
+  await assert.rejects(findOldAgentNotebooks({token,fetcher:async()=>Response.json({active:false}),now}),/did not accept the saved token/);
+  await assert.rejects(findOldAgentNotebooks({token,fetcher:async url=>url.endsWith('/IntrospectToken')?Response.json({active:true,username:'alice'}):new Response('{}',{status:500}),now}),/did not return your notebook list/);
 });

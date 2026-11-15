@@ -47,9 +47,9 @@ try{
 }finally{await runtime?.cleanup();model.closeAllConnections();await new Promise(resolve=>model.close(resolve));}
 
 // B. The real setup page. It keeps a live event stream open, so wait for its Start button, not for network idle.
-const seen=[];let browser;
+const seen=[],cleanup=[],old=['qwen-agent-'+'a'.repeat(24),'qwen-agent-'+'b'.repeat(24)];let browser;
 const open=async()=>{let finish;const done=new Promise(resolve=>finish=resolve);
-  const local=await startSetupServer({controllerDependencies:{preferenceFile:path.join(root,'prefs.json'),hasRememberedToken:async()=>true,launch:async args=>{seen.push(args);return {done,close:async()=>finish({code:0})};}}});
+  const local=await startSetupServer({controllerDependencies:{preferenceFile:path.join(root,'prefs.json'),hasRememberedToken:async()=>true,loadSavedToken:async()=>'KGAT_cleanup_fixture_0123456789',findOldNotebooks:async()=>{cleanup.push('find');return {owner:'fixture',old,kept:1};},removeOldNotebooks:async()=>{cleanup.push('remove');return {owner:'fixture',removed:[old[0]],failed:[old[1]],kept:1};},launch:async args=>{seen.push(args);return {done,close:async()=>finish({code:0})};}}});
   return {local,stop:async()=>{finish({code:0});await local.close();}};};
 try{
   browser=await chromium.launch({headless:true});
@@ -58,6 +58,15 @@ try{
     const page=await browser.newPage();const errors=[];page.on('pageerror',error=>errors.push(String(error)));
     await page.goto(setup.local.url,{waitUntil:'load'});await page.waitForSelector('#start:not([disabled])',{timeout:15000});
     assert.equal(await page.isChecked('#resume'),false,'Continue must be off until chosen');
+    // C. Remove old notebooks: counted first, deleted only after the dialog is confirmed.
+    await page.click('#clean-notebooks');await page.waitForSelector('#clean-dialog[open]',{timeout:10000});
+    assert((await page.textContent('#clean-summary')).startsWith('Found 2 finished notebooks'));assert.deepEqual(cleanup,['find']);
+    await page.keyboard.press('Escape');await new Promise(resolve=>setTimeout(resolve,400));assert.deepEqual(cleanup,['find'],'Closing the dialog must not delete anything');
+    await page.click('#clean-notebooks');await page.waitForSelector('#clean-dialog[open]',{timeout:10000});await page.click('#clean-dialog button[value="remove"]');
+    await page.waitForFunction(()=>document.getElementById('clean-result').textContent.startsWith('Removed'),null,{timeout:10000});
+    assert.equal(await page.textContent('#clean-result'),'Removed 1 old notebook; 1 could not be removed.');assert.deepEqual(cleanup,['find','find','remove']);
+    await page.click('#clean-notebooks');await page.waitForSelector('#clean-dialog[open]',{timeout:10000});await page.keyboard.press('Escape');await new Promise(resolve=>setTimeout(resolve,400));
+    assert.deepEqual(cleanup,['find','find','remove','find'],'A dialog dismissed after an earlier yes must not delete again');result.cleanupNeedsConfirmationEveryTime=true;
     await page.fill('#folder',project);await page.check('#resume');await page.check('#gpu-consent');await page.click('#start');
     for(let i=0;i<300&&!seen.length;i++)await new Promise(resolve=>setTimeout(resolve,20));
     assert.equal(seen.length,1,'Start did not reach the launcher: '+errors.join(' | ')+' | '+await page.textContent('#form-error').catch(()=>''));

@@ -47,7 +47,7 @@
                 <label class="check-row remember-row"><input id="remember-token" type="checkbox" checked><span>Remember securely on this computer<span class="help">Protected with your Windows account encryption.</span></span></label>
               </div>
               <div class="browser-row"><div><label for="browser">Browser &amp; web search</label><p class="help">Isolated Playwright tools, using your model.</p></div><input id="browser" class="switch" type="checkbox" role="switch" checked></div>
-              <div id="saved-token-actions" class="token-actions" hidden><button id="forget-token" class="text-button subtle-button" type="button">Forget saved token</button></div>
+              <div id="saved-token-actions" class="token-actions" hidden><button id="forget-token" class="text-button subtle-button" type="button">Forget saved token</button> <button id="clean-notebooks" class="text-button subtle-button" type="button">Remove old notebooks</button><p id="clean-result" class="help" role="status" hidden></p></div>
             </section>
 
             <section class="form-section launch-section" aria-labelledby="launch-heading">
@@ -90,5 +90,6 @@
   </div>
 
   <dialog id="forget-dialog"><form method="dialog"><h2>Forget your saved token?</h2><p>This removes the encrypted copy from this computer. Your Kaggle token and saved conversations stay available.</p><div class="dialog-actions"><button class="secondary-button" value="cancel">Keep token</button><button class="primary-button" value="forget">Forget token</button></div></form></dialog>
+<dialog id="clean-dialog"><form method="dialog"><h2>Remove old notebooks?</h2><p id="clean-summary"></p><p>This permanently deletes them from your Kaggle account. Notebooks from the last day, notebooks that are still running and everything else in your account are left alone.</p><div class="dialog-actions"><button class="secondary-button" value="cancel">Keep them</button><button class="primary-button" value="remove">Remove notebooks</button></div></form></dialog>
 </body>
 </html>

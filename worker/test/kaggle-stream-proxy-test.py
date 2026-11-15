@@ -330,9 +330,18 @@ class StreamProxyTests(unittest.TestCase):
         ]
         for path, body, headers, expected in cases:
             with self.subTest(path=path, status=expected):
-                connection = self.client()
-                connection.request("POST", path, body=body, headers=headers)
-                response = connection.getresponse()
+                # The proxy answers a rejected request and closes without reading its body. On
+                # Windows that close can reach the client as an abort before the answer is read,
+                # so the same request is asked again; the answer itself is still checked.
+                for attempt in range(4):
+                    connection = self.client()
+                    try:
+                        connection.request("POST", path, body=body, headers=headers)
+                        response = connection.getresponse()
+                        break
+                    except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                        if attempt == 3:
+                            raise
                 self.assertEqual(response.status, expected)
                 self.assertIn("error", json.loads(response.read()))
         self.assertEqual(self.origin.requests, [])

@@ -7,8 +7,8 @@ import {spawn} from 'node:child_process';
 import {randomBytes,timingSafeEqual} from 'node:crypto';
 import {launchOpenCode,openProjectFolder,openKaggleTokenPage,chooseBrowserChannel,recoveryNotebookUrl} from './opencode.mjs';
 import {cleanChildEnvironment,OPENCODE_VERSION,PLAYWRIGHT_MCP_VERSION} from './opencode-config.mjs';
-import {DEFAULT_CREDENTIAL_PATH,secureTokenStorageAvailable,forgetKaggleToken} from './credential-store.mjs';
-import {validateModelUrl,readOwnGpuQuota} from './kaggle-session.mjs';
+import {DEFAULT_CREDENTIAL_PATH,secureTokenStorageAvailable,forgetKaggleToken,loadSavedKaggleToken} from './credential-store.mjs';
+import {validateModelUrl,readOwnGpuQuota,findOldAgentNotebooks,removeOldAgentNotebooks} from './kaggle-session.mjs';
 import {chooseModernFolder} from './folder-picker.mjs';
 
 const HERE=path.dirname(fileURLToPath(import.meta.url));
@@ -47,6 +47,17 @@ export async function createSetupController(deps={}){
   const controller={
     snapshot,subscribe(fn,{snapshot:needsSnapshot=true}={}){listeners.set(fn,needsSnapshot);return()=>listeners.delete(fn);},get busy(){return active;},get work(){return work;},get running(){return state.running;},
     async folder(input={}){if(active||pickerAbort)throw failure('Stop the current setup before changing its project.','setup_busy',409);pickerAbort=new AbortController();try{if(input.path!==undefined&&(typeof input.path!=='string'||input.path.length>32768))throw failure('Choose an existing project folder.');const selected=input.path?.trim()||await(deps.chooseFolder||chooseModernFolder)({initialFolder:state.folder,signal:deps.signal?AbortSignal.any([deps.signal,pickerAbort.signal]):pickerAbort.signal});if(!selected||pickerAbort.signal.aborted)return {folder:state.folder,cancelled:true};const folder=await(deps.openFolder||openProjectFolder)(selected);set({folder});await savePreferences();return {folder,cancelled:false};}finally{pickerAbort=null;}},
+    // Old notebooks are counted first; nothing is deleted until the page asks again with remove.
+    async oldNotebooks(remove){
+      if(active)throw failure('Stop the current setup before removing notebooks.','setup_busy',409);
+      const token=await(deps.loadSavedToken||loadSavedKaggleToken)();
+      if(!token)throw failure('Save your Kaggle token in setup first; it is needed to find your old notebooks.','token_required',400);
+      if(!remove){const found=await(deps.findOldNotebooks||findOldAgentNotebooks)({token});return {...snapshot(),oldNotebooks:{count:found.old.length,kept:found.kept}};}
+      const done=await(deps.removeOldNotebooks||removeOldAgentNotebooks)({token}),plural=count=>count===1?'':'s';
+      event(done.removed.length?'Removed '+done.removed.length+' finished qwen-agent notebook'+plural(done.removed.length)+' older than one day from your Kaggle account.'+(done.failed.length?' '+done.failed.length+' could not be removed; try again later.':'')
+        :done.failed.length?'Kaggle did not remove '+done.failed.length+' old notebook'+plural(done.failed.length)+'. Try again later.':'No finished qwen-agent notebooks older than one day were found.');
+      return {...snapshot(),oldNotebooks:{removed:done.removed.length,failed:done.failed.length,kept:done.kept}};
+    },
     async forgetToken(){if(active)throw failure('Stop the current setup before changing credentials.','setup_busy',409);await(deps.forgetToken||forgetKaggleToken)();set({rememberedToken:false});event('Saved Kaggle token removed. No notebook was started.');return snapshot();},
     async openKaggle(){await(deps.openTokenPage||openKaggleTokenPage)({log:()=>{}});return {opened:true};},
     terminalStarted(){if(!active||abort?.signal.aborted)return;set({phase:'running',title:TITLES.running,detail:'You can close this setup window. Exit OpenCode to stop your personal notebook.',running:true});event('OpenCode started in its own terminal. Your project and account history are retained.');},
@@ -160,6 +171,7 @@ export async function startSetupServer(options={}){
       if(url.pathname==='/api/folder')return json(200,await controller.folder(input));
       if(url.pathname==='/api/open-kaggle')return json(200,await controller.openKaggle());
       if(url.pathname==='/api/forget-token')return json(200,await controller.forgetToken());
+      if(url.pathname==='/api/old-notebooks')return json(200,await controller.oldNotebooks(input.remove===true));
       if(url.pathname==='/api/start')return json(202,controller.start(input));
       if(url.pathname==='/api/cancel'){void controller.cancel();return json(202,controller.snapshot());}
       return json(404,{error:{message:'No such setup action.'}});

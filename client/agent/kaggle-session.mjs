@@ -41,6 +41,49 @@ export function describeGpuQuota(quota){
   return 'Kaggle GPU time left this week: '+hoursAndMinutes(quota.remainingSeconds)+' of '+hoursAndMinutes(quota.totalSeconds)+'.'+(day?' It resets on '+day+'.':'');
 }
 
+const AGENT_NOTEBOOK=/^qwen-agent-[a-f0-9]{24}$/;
+const FINISHED_NOTEBOOK=['COMPLETE','ERROR','CANCELED','CANCELLED','CANCEL_ACKNOWLEDGED'];
+async function kaggleOwn(token,service,method,body,fetcher,signal){
+  let response;try{response=await fetcher('https://api.kaggle.com/v1/'+service+'/'+method,{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify(body),redirect:'error',signal:signal??AbortSignal.timeout(30000)});}catch{return {status:0,value:null};}
+  let value=null;try{value=await response.json();}catch{}
+  return {status:response.status,value};
+}
+/** This helper's own finished notebooks (qwen-agent-<id>) whose last run began at least minAgeMs ago. */
+export async function findOldAgentNotebooks({token,fetcher=fetch,now=Date.now(),minAgeMs=24*60*60*1000,signal}={}){
+  const who=await kaggleOwn(token,'security.OAuthService','IntrospectToken',{token},fetcher,signal),owner=who.value?.username;
+  if(who.status!==200||who.value?.active!==true||!/^[A-Za-z0-9_-]{1,64}$/.test(owner||''))throw Object.assign(new Error('Kaggle did not accept the saved token. Save it again in setup.'),{code:'kaggle_token_rejected'});
+  const candidates=[];let pageToken=null,pages=0,newer=0;
+  do{
+    const list=await kaggleOwn(token,'kernels.KernelsApiService','ListKernels',{group:'PROFILE',user:'',language:'all',kernelType:'all',outputType:'all',pageSize:100,...(pageToken?{pageToken}:{page:1})},fetcher,signal);
+    const kernels=list.value?.kernels??[];
+    if(list.status!==200||!Array.isArray(kernels))throw Object.assign(new Error('Kaggle did not return your notebook list. Try again in a moment.'),{code:'kaggle_list_failed'});
+    for(const kernel of kernels){
+      const [author,slug,...rest]=String(kernel?.ref||'').split('/');
+      if(rest.length||author.toLowerCase()!==owner.toLowerCase()||!AGENT_NOTEBOOK.test(slug||''))continue;
+      const ran=Date.parse(kernel.lastRunTime);
+      if(Number.isFinite(ran)&&now-ran>=minAgeMs)candidates.push(slug);else newer++;
+    }
+    pageToken=typeof list.value?.nextPageToken==='string'&&list.value.nextPageToken?list.value.nextPageToken:null;pages++;
+  }while(pageToken&&pages<20);
+  const old=[];let unfinished=0;
+  for(const slug of candidates.slice(0,100)){
+    const run=await kaggleOwn(token,'kernels.KernelsApiService','GetKernelSessionStatus',{userName:owner,kernelSlug:slug},fetcher,signal);
+    // Only a notebook Kaggle reports as finished is removed; anything unclear is kept.
+    if(run.status===200&&FINISHED_NOTEBOOK.includes(String(run.value?.status||'').toUpperCase()))old.push(slug);else unfinished++;
+  }
+  return {owner,old,kept:newer+unfinished+Math.max(0,candidates.length-100)};
+}
+/** Deletes what findOldAgentNotebooks finds; a notebook Kaggle refuses to delete is reported, not retried. */
+export async function removeOldAgentNotebooks(options={}){
+  const {token,fetcher=fetch,signal}=options,found=await findOldAgentNotebooks(options),removed=[],failed=[];
+  for(const slug of found.old){
+    if(!AGENT_NOTEBOOK.test(slug)){failed.push(slug);continue;}
+    const result=await kaggleOwn(token,'kernels.KernelsApiService','DeleteKernel',{userName:found.owner,kernelSlug:slug},fetcher,signal);
+    (result.status===200?removed:failed).push(slug);
+  }
+  return {owner:found.owner,removed,failed,kept:found.kept};
+}
+
 export function validatePersonalSession(value,{now=Date.now(),requireFresh=true}={}){
   if(!value||typeof value!=='object'||Array.isArray(value)||!ID.test(value.session_id||'')||value.host!=='kaggle'||
      typeof value.key!=='string'||!/^[A-Za-z0-9_-]{24,256}$/.test(value.key)||

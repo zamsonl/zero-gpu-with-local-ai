@@ -138,6 +138,26 @@ $('change-token').addEventListener('click',()=>{tokenChanged=true;render(state);
 $('reveal-token').addEventListener('click',()=>{const show=$('token').type==='password';$('token').type=show?'text':'password';$('reveal-token').setAttribute('aria-label',show?'Hide token':'Show token');$('reveal-token').title=show?'Hide token':'Show token';});
 $('forget-token').addEventListener('click',()=>{$('forget-dialog').showModal();});
 $('forget-dialog').addEventListener('close',async()=>{if($('forget-dialog').returnValue!=='forget')return;try{const result=await api('/api/forget-token',{});tokenChanged=false;state.rememberedToken=false;render(result?.phase||result?.state?result:state);$('token').focus();}catch(error){actionError=messageOf(error);setError($('form-error'),actionError);}});
+const cleanNote=text=>{$('clean-result').textContent=text;$('clean-result').hidden=!text;};
+$('clean-notebooks').addEventListener('click',async()=>{
+  $('clean-notebooks').disabled=true;cleanNote('Checking your Kaggle notebooks…');
+  try{
+    const found=(await api('/api/old-notebooks',{remove:false},{timeout:120000}))?.oldNotebooks;
+    if(!found?.count){cleanNote('Nothing to remove: no finished qwen-agent notebooks older than one day.');return;}
+    cleanNote('');$('clean-summary').textContent='Found '+found.count+' finished notebook'+(found.count===1?'':'s')+' named qwen-agent-… that last ran more than a day ago.';
+    // A dialog keeps its last answer, so clear it: closing with Escape must never count as a yes.
+    $('clean-dialog').returnValue='';$('clean-dialog').showModal();
+  }catch(error){cleanNote(messageOf(error));}finally{$('clean-notebooks').disabled=false;}
+});
+$('clean-dialog').addEventListener('close',async()=>{
+  if($('clean-dialog').returnValue!=='remove')return;
+  $('clean-dialog').returnValue='';$('clean-notebooks').disabled=true;cleanNote('Removing old notebooks…');
+  try{
+    const result=await api('/api/old-notebooks',{remove:true},{timeout:300000}),done=result?.oldNotebooks||{};
+    render(result?.phase||result?.state?result:state);
+    cleanNote(done.removed?'Removed '+done.removed+' old notebook'+(done.removed===1?'':'s')+(done.failed?'; '+done.failed+' could not be removed.':'.'):done.failed?'Kaggle did not remove them. Try again later.':'Nothing to remove.');
+  }catch(error){cleanNote(messageOf(error));}finally{$('clean-notebooks').disabled=false;}
+});
 $('setup-form').addEventListener('submit',async event=>{
   event.preventDefault();if(busy()||state.phase==='running'||state.canRetry===false&&state.phase==='error')return;clearErrors();
   const folder=$('folder').value.trim(),token=$('token').value.trim(),modelUrl=$('model-url').value.trim();
