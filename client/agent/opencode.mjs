@@ -592,8 +592,10 @@ async function launchOpenCodeInner(args,dependencies,context){
     log('The connector keeps your personal notebook online while this window is open. Requests may run for up to two hours; Kaggle runtime and quota limits still apply.');
     const resume=options['--continue']?['--continue']:options['--session']?['--session',options['--session']]:[];
     // OpenCode's own title updates are off, so this window title stays up as a reminder.
-    if(!dependencies.spawnProcess&&session.model_profile?.thinking!==false){try{process.title='Heretic Qwen · Ctrl+T changes thinking mode (fast, light, normal, deep)';}catch{}}
-    child=(dependencies.spawnProcess||spawn)(invocation.command,[...invocation.args,folder,'--model',MODEL,'--agent','build',...resume],{cwd:folder,env:runtime.env,stdio:'inherit',shell:false,windowsHide:false});
+    // Guided setup opens OpenCode in a console of its own, so the title travels with the handoff.
+    const windowTitle=session.model_profile?.thinking===false?undefined:'Heretic Qwen · Ctrl+T changes thinking mode (fast, light, normal, deep)';
+    if(windowTitle&&!dependencies.spawnProcess){try{process.title=windowTitle;}catch{}}
+    child=(dependencies.spawnProcess||spawn)(invocation.command,[...invocation.args,folder,'--model',MODEL,'--agent','build',...resume],{cwd:folder,env:runtime.env,stdio:'inherit',shell:false,windowsHide:false,...(windowTitle?{title:windowTitle}:{})});
     child.once('close',(code,signal)=>{exit={code:Number.isInteger(code)?code:signal?1:0,signal};void close({terminate:false}).catch(()=>{});});
     child.once('error',()=>{exit={code:1,signal:null};log('OpenCode could not start. Check its pinned installation.');stage('running','error','OpenCode could not start. Check its pinned installation.');void close({terminate:false}).catch(()=>{});});
     dependencies.signal?.addEventListener('abort',onAbort,{once:true});

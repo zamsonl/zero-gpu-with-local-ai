@@ -385,7 +385,7 @@ test('launcher validates local prerequisites before personal credentials and nev
   const f=fixture();const running=await launchOpenCode(launchArgs,f.deps);
   assert.deepEqual(f.calls,['folder','managed','cli','token','consent','launch','keepalive','ready','runtime','spawn']);
   assert.deepEqual(f.spawned.args,['selected-project','--model',MODEL,'--agent','build']);assert(!f.spawned.args.includes('--auto'));
-  assert.equal(f.spawned.options.cwd,'selected-project');assert.equal(f.spawned.options.shell,false);
+  assert.equal(f.spawned.options.cwd,'selected-project');assert.equal(f.spawned.options.shell,false);assert(f.spawned.options.title.includes('Ctrl+T changes thinking mode'),'the thinking-mode shortcut travels with the spawn so guided setup can title the OpenCode window');
   assert.equal(f.spawned.options.env.KAGGLE_KEY,undefined);assert(!f.logs.join('\n').includes(TOKEN));assert(!f.logs.join('\n').includes(f.own.key));
   await Promise.all([running.close(),running.close()]);assert.equal(f.shutdown,1);assert.equal(f.cleanup,1);assert.equal(f.terminated,1);assert.equal((await running.done).code,0);
   for(const args of [['--config','owner.json'],['--model','external/free'],['--auto'],['--with-browser','--with-browser']])assert.throws(()=>parseOpenCodeOptions(args));

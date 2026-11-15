@@ -10,6 +10,8 @@ try{
   const payload=await response.json();
   if(typeof payload.command!=='string'||!Array.isArray(payload.args)||!payload.args.every(value=>typeof value==='string')||typeof payload.cwd!=='string'||!payload.env||typeof payload.env!=='object')throw new Error('Invalid terminal handoff.');
   if(!process.stdin.isTTY||!process.stdout.isTTY)throw new Error('The coding terminal needs an interactive console.');
+  // This process owns the console OpenCode draws in, so its title is the window title.
+  if(typeof payload.title==='string'&&payload.title.length<=120){try{process.title=payload.title;}catch{}}
   child=spawn(payload.command,payload.args,{cwd:payload.cwd,env:payload.env,shell:false,stdio:'inherit',windowsHide:false});
   const completion=new Promise(resolve=>child.once('close',code=>resolve(Number.isInteger(code)?code:1)));
   await new Promise((resolve,reject)=>{child.once('spawn',resolve);child.once('error',reject);});

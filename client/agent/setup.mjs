@@ -122,7 +122,7 @@ export function spawnTerminalHost({origin,capability,folder,spawnProcess=spawn,p
 export async function startSetupServer(options={}){
   const capability=randomBytes(32).toString('hex'),terminals=new Map(),clients=new Set();let origin,leaveAt=null,timer,publishTimer,lastPing=Date.now(),shutting=false;
   const controller=await createSetupController({...options.controllerDependencies,spawnTerminal:(command,args,spawnOptions)=>{
-    const hostKey=randomBytes(32).toString('hex');terminals.set(hostKey,{payload:{command,args,env:spawnOptions.env,cwd:spawnOptions.cwd},used:false});
+    const hostKey=randomBytes(32).toString('hex');terminals.set(hostKey,{payload:{command,args,env:spawnOptions.env,cwd:spawnOptions.cwd,...(typeof spawnOptions.title==='string'?{title:spawnOptions.title}:{})},used:false});
     const child=(options.spawnTerminalHost||spawnTerminalHost)({origin,capability:hostKey,folder:spawnOptions.cwd});child.once('close',()=>terminals.delete(hostKey));child.once('error',()=>terminals.delete(hostKey));return child;
   }});
   const same=(a,b)=>{const x=Buffer.from(a||''),y=Buffer.from(b);return x.length===y.length&&timingSafeEqual(x,y);};
