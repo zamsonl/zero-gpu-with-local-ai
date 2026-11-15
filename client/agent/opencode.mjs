@@ -8,7 +8,7 @@ import {createRequire} from 'node:module';
 import readline from 'node:readline';
 import {DEFAULT_CREDENTIAL_PATH,loadSavedKaggleToken,saveKaggleToken,forgetKaggleToken,secureTokenStorageAvailable} from './credential-store.mjs';
 import {chooseFolder} from './start.mjs';
-import {createOwnKaggleSession,requestOwnShutdown,promptHiddenToken,confirmGpuUsage,validatePersonalSession,validateModelUrl,probeOwnNotebook} from './kaggle-session.mjs';
+import {createOwnKaggleSession,requestOwnShutdown,promptHiddenToken,confirmGpuUsage,validatePersonalSession,validateModelUrl,probeOwnNotebook,readOwnGpuQuota,describeGpuQuota,quotaResetDay} from './kaggle-session.mjs';
 import {prepareOwnCache} from './cache.mjs';
 import {requireRelayOrigin} from './deployment.mjs';
 import {ownCloudRequest,startPersonalKeepAlive} from './cloud.mjs';
@@ -392,6 +392,20 @@ export async function terminateOwnedChild(child,{platform=process.platform,spawn
   });
 }
 
+/** True when OpenCode itself lists a saved conversation for this project. Only the count is used. */
+export async function hasSavedConversation(invocation,{folder,env,spawnProcess=spawn,timeoutMs=20000}={}){
+  return new Promise(resolve=>{
+    let child,output='',settled=false;
+    const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);resolve(value);};
+    const timer=setTimeout(()=>{try{child?.kill();}catch{}finish(false);},timeoutMs);
+    try{child=spawnProcess(invocation.command,[...invocation.args,'session','list','--format','json','-n','1'],{cwd:folder,env:{...env,PWD:folder},shell:false,windowsHide:true,stdio:['ignore','pipe','ignore']});}
+    catch{finish(false);return;}
+    child.stdout?.on('data',data=>{if(output.length<262144)output+=data;});
+    child.once('error',()=>finish(false));
+    child.once('close',code=>{if(code!==0){finish(false);return;}try{const list=JSON.parse(output);finish(Array.isArray(list)&&list.length>0);}catch{finish(false);}});
+  });
+}
+
 export async function launchOpenCode(args=process.argv.slice(2),dependencies={}){
   const secrets=new Set();let stage='checking';
   const progress=event=>{if(PROGRESS_STAGES.has(event.stage))stage=event.stage;emitSetupProgress(dependencies.onProgress,event,[...secrets]);};
@@ -518,6 +532,19 @@ async function launchOpenCodeInner(args,dependencies,context){
   if((setup||remembered)&&(typeof token!=='string'||!/^KGAT_[A-Za-z0-9_-]{16,251}$/.test(token.trim()))){token='';throw new Error(remembered?'The saved Kaggle token is invalid. Run node opencode.mjs --forget-kaggle-token, then run setup again. No GPU notebook was launched.':'Copy the modern KGAT_ token value from '+KAGGLE_TOKEN_SETTINGS_URL+' and run setup again. No GPU notebook was launched.');}
   if(cancelled()){token='';return null;}
   if(typeof token==='string')context.secrets.add(token);
+  // Shown before anything is launched: a used-up allowance otherwise looks like a notebook that never starts.
+  if(dependencies.readQuota&&typeof token==='string'){
+    let quota=null;try{quota=await dependencies.readQuota({token,signal:dependencies.signal?AbortSignal.any([dependencies.signal,AbortSignal.timeout(10000)]):AbortSignal.timeout(10000)});}catch{}
+    if(cancelled()){context.secrets.delete(token);token='';return null;}
+    if(quota){
+      const line=describeGpuQuota(quota);log(line);stage('token','running',line);
+      if(quota.remainingSeconds<60){
+        const day=quotaResetDay(quota);context.secrets.delete(token);token='';
+        throw new Error('Your Kaggle GPU time for this week is used up.'+(day?' It resets on '+day+'.':'')+' No GPU notebook was launched.');
+      }
+      if(quota.remainingSeconds<1800)log('Less than 30 minutes of GPU time is left, so Kaggle may stop this session early.');
+    }
+  }
   stage('consent','pending','Confirm use of your own Kaggle GPU allowance.');
   if(setup)log('Step 3/3 · Review GPU usage. The token value stays out of logs, OpenCode settings and model messages.');
   const consent=options['--consent-kaggle-gpu']===true||await(dependencies.confirmUsage||confirmGpuUsage)();
@@ -590,7 +617,11 @@ async function launchOpenCodeInner(args,dependencies,context){
     log('Automatic context compaction uses the same hosted model and continues from saved session notes. Original local history remains saved.');
     log('Edits, shell commands and browser actions ask for approval. Exit OpenCode or press Ctrl+C to request notebook shutdown.');
     log('The connector keeps your personal notebook online while this window is open. Requests may run for up to two hours; Kaggle runtime and quota limits still apply.');
-    const resume=options['--continue']?['--continue']:options['--session']?['--session',options['--session']]:[];
+    let resume=options['--continue']?['--continue']:options['--session']?['--session',options['--session']]:[];
+    // Asked to continue with nothing saved, OpenCode opens a placeholder conversation instead of a new one.
+    if(options['--continue']&&!await(dependencies.hasConversation||hasSavedConversation)(invocation,{folder,env:runtime.env})){
+      resume=[];log('No earlier conversation was found for this folder, so OpenCode starts a new one. If you expected one, type /sessions inside OpenCode.');
+    }
     // OpenCode's own title updates are off, so this window title stays up as a reminder.
     // Guided setup opens OpenCode in a console of its own, so the title travels with the handoff.
     const windowTitle=session.model_profile?.thinking===false?undefined:'Heretic Qwen · Ctrl+T changes thinking mode (fast, light, normal, deep)';
@@ -613,7 +644,7 @@ if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.ur
   const cancellation=new AbortController();let running=null;
   const stop=()=>{if(!cancellation.signal.aborted){cancellation.abort();if(!running)console.log('Cancellation requested. Waiting for any queued personal launch so its shutdown can be requested.');}};
   for(const signal of ['SIGINT','SIGTERM'])process.on(signal,stop);
-  launchOpenCode(process.argv.slice(2),{signal:cancellation.signal}).then(async value=>{
+  launchOpenCode(process.argv.slice(2),{signal:cancellation.signal,readQuota:readOwnGpuQuota}).then(async value=>{
     running=value;if(!value)return;if(cancellation.signal.aborted)await value.close();
     const result=await value.done;process.exitCode=result.code;
   }).catch(error=>{console.error(error.message);process.exitCode=1;});

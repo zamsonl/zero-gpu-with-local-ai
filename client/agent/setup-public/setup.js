@@ -69,7 +69,7 @@ function render(next){
   if(!isBusy&&!running){const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 20 20');svg.setAttribute('aria-hidden','true');const path=document.createElementNS(svg.namespaceURI,'path');path.setAttribute('d','M4 10h12m-5-5 5 5-5 5');svg.append(path);$('start').append(svg);}
   $('start').disabled=isBusy||running||(phase==='error'&&state.canRetry===false);
   $('start-help').textContent=state.retrySameLaunch?'Rechecks the saved launch reference without submitting another notebook.':phase==='error'&&state.canRetry===false?'Check your Kaggle notebook before starting another session.':running?'OpenCode owns this notebook now.':'OpenCode opens when your model is ready.';
-  if(!initialized){if(state.folder){$('folder').value=state.folder;folderEdited=true;}if(typeof state.browser==='boolean')$('browser').checked=state.browser;if(state.modelUrl)$('model-url').value=state.modelUrl;initialized=true;}
+  if(!initialized){if(state.folder){$('folder').value=state.folder;folderEdited=true;}if(typeof state.browser==='boolean')$('browser').checked=state.browser;if(typeof state.resume==='boolean')$('resume').checked=state.resume;if(state.modelUrl)$('model-url').value=state.modelUrl;initialized=true;}
   if(state.folder&&!folderEdited&&document.activeElement!==$('folder'))$('folder').value=state.folder;
   const saved=!!state.rememberedToken;
   $('saved-token').hidden=!saved||tokenChanged;$('token-entry').hidden=saved&&!tokenChanged;$('saved-token-actions').hidden=!saved;
@@ -146,7 +146,7 @@ $('setup-form').addEventListener('submit',async event=>{
   if((!state.rememberedToken||tokenChanged)&&!/^KGAT_[A-Za-z0-9_-]{16,251}$/.test(token)){setError($('token-error'),'Paste the complete modern API token beginning with KGAT_.');$('token').setAttribute('aria-invalid','true');$('token').focus();return;}
   if(!$('gpu-consent').checked){setError($('form-error'),'Confirm using your own Kaggle GPU allowance before starting.');$('gpu-consent').focus();return;}
   const confirmDeletedNotebooks=!$('deleted-notebook-recovery').hidden&&$('confirm-deleted-notebooks').checked;
-  const payload={folder,modelUrl,token:(!state.rememberedToken||tokenChanged)?token:'',rememberToken:state.rememberedToken&&!tokenChanged?true:$('remember-token').checked&&state.secureStorageAvailable!==false,browser:$('browser').checked,installConsent:$('install-consent').checked,gpuConsent:true,...(confirmDeletedNotebooks?{confirmDeletedNotebooks:true}:{})};
+  const payload={folder,modelUrl,token:(!state.rememberedToken||tokenChanged)?token:'',rememberToken:state.rememberedToken&&!tokenChanged?true:$('remember-token').checked&&state.secureStorageAvailable!==false,browser:$('browser').checked,resume:$('resume').checked,installConsent:$('install-consent').checked,gpuConsent:true,...(confirmDeletedNotebooks?{confirmDeletedNotebooks:true}:{})};
   $('confirm-deleted-notebooks').checked=false;
   submitting=true;serverStartedAt=Date.now();render(state);
   try{const result=await api('/api/start',payload,{timeout:30000});$('token').value='';payload.token='';applyActionState(result);if(!result?.phase&&!result?.state)await refresh();}

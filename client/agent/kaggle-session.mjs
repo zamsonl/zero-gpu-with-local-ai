@@ -23,6 +23,24 @@ export async function probeOwnNotebook(session,{token,fetcher=fetch,signal}={}){
   const value=await response.json();return {status:String(value.status||'').toUpperCase()};
 }
 
+const quotaSeconds=value=>{const match=/^(\d+(?:\.\d+)?)s$/.exec(typeof value==='string'?value:'');return match?Number(match[1]):NaN;};
+/** Kaggle's own weekly GPU allowance for the token's account, or null when it cannot be read. */
+export async function readOwnGpuQuota({token,fetcher=fetch,signal}={}){
+  let response;try{response=await fetcher('https://api.kaggle.com/v1/kernels.KernelsApiService/GetAcceleratorQuotaStatistics',{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:'{}',redirect:'error',signal:signal??AbortSignal.timeout(10000)});}catch{return null;}
+  if(!response.ok){await response.body?.cancel();return null;}
+  let value;try{value=await response.json();}catch{return null;}
+  const gpu=value?.gpuQuota,total=quotaSeconds(gpu?.totalTimeAllowed),used=quotaSeconds(gpu?.timeUsed),held=quotaSeconds(gpu?.timeReserved);
+  if(!(total>0)||!(used>=0))return null;
+  const reserved=held>=0?held:0,refresh=Date.parse(value.quotaRefreshTime);
+  return {totalSeconds:total,usedSeconds:used,reservedSeconds:reserved,remainingSeconds:Math.max(0,total-used-reserved),...(Number.isFinite(refresh)?{refreshesAt:new Date(refresh).toISOString()}:{})};
+}
+const hoursAndMinutes=seconds=>{const minutes=Math.floor(seconds/60),hours=Math.floor(minutes/60),rest=minutes%60;return hours&&rest?hours+' h '+rest+' min':hours?hours+' h':rest+' min';};
+export const quotaResetDay=quota=>quota?.refreshesAt?new Date(quota.refreshesAt).toLocaleDateString('en-GB',{day:'numeric',month:'short',timeZone:'UTC'}):'';
+export function describeGpuQuota(quota){
+  const day=quotaResetDay(quota);
+  return 'Kaggle GPU time left this week: '+hoursAndMinutes(quota.remainingSeconds)+' of '+hoursAndMinutes(quota.totalSeconds)+'.'+(day?' It resets on '+day+'.':'');
+}
+
 export function validatePersonalSession(value,{now=Date.now(),requireFresh=true}={}){
   if(!value||typeof value!=='object'||Array.isArray(value)||!ID.test(value.session_id||'')||value.host!=='kaggle'||
      typeof value.key!=='string'||!/^[A-Za-z0-9_-]{24,256}$/.test(value.key)||

@@ -108,3 +108,16 @@ test('recovery checkbox appears only for its safe error and never authorizes a l
   ui.controls.render({...initial,error:{...error,notebookUrl:'https://evil.invalid/notebook'}});assert.equal(ui.element('deleted-notebook-recovery').hidden,true);assert.equal(ui.element('confirm-deleted-notebooks').checked,false);
   const reopened=await setupPage(initial);assert.equal(reopened.element('confirm-deleted-notebooks').checked,false);
 });
+
+test('continuing the last conversation is an explicit, remembered choice passed to the launcher',async()=>{
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'qwen-setup-test-'));const seen=[];
+  const start=async extra=>{const end=deferred();const local=await startSetupServer({controllerDependencies:{preferenceFile:path.join(directory,'prefs.json'),hasRememberedToken:async()=>true,launch:async(args,deps)=>{seen.push({args,readQuota:typeof deps.readQuota});return {done:end.promise,close:async()=>end.resolve({code:0})};}}});
+    try{const before=local.controller.snapshot().resume,count=seen.length;local.controller.start({...choices,folder:directory,...extra});for(let i=0;i<200&&seen.length===count;i++)await new Promise(r=>setTimeout(r,10));assert.equal(seen.length,count+1,'the launcher was not reached');return before;}finally{end.resolve({code:0});await local.close();}};
+  const remembered=async()=>{for(let i=0;i<150;i++){try{if(JSON.parse(await fs.readFile(path.join(directory,'prefs.json'),'utf8')).resume===true)return true;}catch{}await new Promise(r=>setTimeout(r,20));}return false;};
+  try{
+    assert.equal(await start({}),false,'off until chosen');assert(!seen[0].args.includes('--continue'));assert.equal(seen[0].readQuota,'function','guided setup reads the GPU allowance before launch');
+    await start({resume:true});assert(seen[1].args.includes('--continue'));assert.equal(await remembered(),true,'the choice is saved with the other setup preferences');
+    assert.equal(await start({resume:true}),true,'the choice is remembered for the next setup window');
+    await start({resume:'yes'});assert(!seen[3].args.includes('--continue'),'only an explicit true continues');
+  }finally{await fs.rm(directory,{recursive:true,force:true});}
+});

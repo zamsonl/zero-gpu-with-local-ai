@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {RELAY_ORIGIN} from '../kaggle-session.mjs';
 import {createOpenCodeConfig,createOpenCodeRuntime,cleanChildEnvironment,isolatedEnvironment,assertNoManagedOpenCode,initializeThinkingVisibility,OPEN_CODE_REQUEST_TIMEOUT_MS,OPEN_CODE_TRANSPORT_TIMEOUT_MS,MODEL,MODEL_ID,PROVIDER_ID,RELAY_KEY_ENV,OPENCODE_VERSION} from '../opencode-config.mjs';
-import {launchOpenCode,parseOpenCodeOptions,resolveOpenCode,installLocalTools,waitForOwnReady,chooseBrowserChannel,preflightBrowser,browserRuntimeAvailable,openKaggleTokenPage,KAGGLE_TOKEN_SETTINGS_URL,confirmSetupStep} from '../opencode.mjs';
+import {launchOpenCode,parseOpenCodeOptions,resolveOpenCode,installLocalTools,waitForOwnReady,chooseBrowserChannel,preflightBrowser,browserRuntimeAvailable,openKaggleTokenPage,KAGGLE_TOKEN_SETTINGS_URL,confirmSetupStep,hasSavedConversation} from '../opencode.mjs';
 
 const TOKEN='KGAT_test_personal_token_123456789012345';
 const ID='personal_session_1234567890';
@@ -412,8 +412,16 @@ test('cancellation during a queued bootstrap waits for its own identity and requ
 });
 
 test('resume arguments keep the configured Qwen model and fresh personal connection',async()=>{
-  const f=fixture();const running=await launchOpenCode([...launchArgs,'--continue'],f.deps);
+  const f=fixture();f.deps.hasConversation=async()=>true;const running=await launchOpenCode([...launchArgs,'--continue'],f.deps);
   assert.equal(f.spawned.args.at(-1),'--continue');assert(f.spawned.args.includes(MODEL));await running.close();
+  // With nothing saved, continue must open a new conversation: OpenCode would otherwise show a placeholder one.
+  const fresh=fixture(),notes=[];fresh.deps.log=line=>notes.push(line);fresh.deps.hasConversation=async()=>false;const started=await launchOpenCode([...launchArgs,'--continue'],fresh.deps);
+  assert(!fresh.spawned.args.includes('--continue'));assert(notes.some(line=>line.includes('No earlier conversation was found')));await started.close();
+  // The built-in check asks OpenCode for one listed conversation and uses only whether any came back.
+  const listing=(output,code=0)=>(command,args,options)=>{assert.equal(command,'installed-opencode');assert.deepEqual(args,['session','list','--format','json','-n','1']);assert.equal(options.cwd,'selected-project');assert.equal(options.env.PWD,'selected-project');const child=new EventEmitter();child.stdout=new EventEmitter();queueMicrotask(()=>{if(output)child.stdout.emit('data',output);child.emit('close',code);});return child;};
+  const ask=spawnProcess=>hasSavedConversation({command:'installed-opencode',args:[]},{folder:'selected-project',env:{},spawnProcess});
+  assert.equal(await ask(listing('[{"id":"ses_1","title":"private title"}]')),true);assert.equal(await ask(listing('')),false);assert.equal(await ask(listing('[]')),false);
+  assert.equal(await ask(listing('[{"id":"ses_1"}]',1)),false);assert.equal(await ask(listing('not json')),false);assert.equal(await ask(()=>{throw new Error('missing');}),false);
   const g=fixture();const resumed=await launchOpenCode([...launchArgs,'--session','ses_local_example'],g.deps);
   assert.deepEqual(g.spawned.args.slice(-2),['--session','ses_local_example']);await resumed.close();
   assert.throws(()=>parseOpenCodeOptions(['--continue','--session','ses_local_example']));
@@ -660,3 +668,19 @@ test('custom GGUF uses measured context and preserves approvals with automatic c
 test('unsupported custom model hosts fail before local tool setup or token access',async()=>{await assert.rejects(launchOpenCode(['--model-url','https://ollama.com/library/qwen'],{log(){},loadSavedToken:async()=>{assert.fail('Invalid model must not read a token');}}),/Hugging Face GGUF only/);});
 
 test('custom readiness requires the same source and the actual loaded context',async()=>{const source='https://huggingface.co/example/model-GGUF',profile={source_url:source,label:'Selected GGUF',context:32768,quant:'Q4_K_M',num_batch:128,profile_id:'hfgguf:'+'a'.repeat(24)},own={...session(),model_profile:profile};let confirmed;assert.equal(await waitForOwnReady(own,{log(){},onReady:value=>confirmed=value,request:async()=>({server:'ready',num_ctx:16384,model_profile:{...profile,context:16384}})}),true);assert.equal(confirmed.num_ctx,16384);await assert.rejects(waitForOwnReady(own,{log(){},request:async()=>({server:'ready',num_ctx:16384})}),/custom model readiness profile could not be confirmed/);});
+
+test('Kaggle GPU time is shown before launch, and a used-up allowance stops before any notebook',async()=>{
+  const quota=remaining=>async({token})=>{assert.equal(token,TOKEN);return {totalSeconds:108000,usedSeconds:108000-remaining,reservedSeconds:0,remainingSeconds:remaining,refreshesAt:'2026-11-21T00:00:00.000Z'};};
+  const f=fixture(),lines=[];f.deps.log=line=>lines.push(line);f.deps.readQuota=quota(98668.4);
+  const running=await launchOpenCode(launchArgs,f.deps);
+  assert(lines.includes('Kaggle GPU time left this week: 27 h 24 min of 30 h. It resets on 21 Nov.'),lines.join('\n'));
+  assert(!lines.some(line=>line.includes('Less than 30 minutes')));await running.close();
+  const low=fixture(),warned=[];low.deps.log=line=>warned.push(line);low.deps.readQuota=quota(1200);
+  const short=await launchOpenCode(launchArgs,low.deps);assert(warned.some(line=>line.includes('Less than 30 minutes of GPU time is left')));await short.close();
+  const spent=fixture();let launches=0;const create=spent.deps.createSession;spent.deps.createSession=async value=>{launches++;return create(value);};spent.deps.readQuota=quota(0);
+  await assert.rejects(launchOpenCode(launchArgs,spent.deps),error=>error.message.includes('Your Kaggle GPU time for this week is used up. It resets on 21 Nov. No GPU notebook was launched.')&&!error.message.includes(TOKEN));
+  assert.equal(launches,0);assert.equal(spent.spawned,undefined);
+  // A quota that cannot be read never blocks a launch, and without the reader nothing is asked.
+  const offline=fixture();offline.deps.readQuota=async()=>{throw new Error('offline');};const still=await launchOpenCode(launchArgs,offline.deps);await still.close();
+  const silent=fixture();silent.deps.readQuota=async()=>null;const plain=await launchOpenCode(launchArgs,silent.deps);await plain.close();
+});

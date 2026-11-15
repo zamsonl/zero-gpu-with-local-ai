@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {EventEmitter} from 'node:events';
-import {RELAY_ORIGIN,createOwnKaggleSession,requestOwnShutdown,validatePersonalSession,promptHiddenToken} from '../kaggle-session.mjs';
+import {RELAY_ORIGIN,createOwnKaggleSession,requestOwnShutdown,validatePersonalSession,promptHiddenToken,readOwnGpuQuota,describeGpuQuota} from '../kaggle-session.mjs';
 import {launchAgent,parseOptions} from '../start.mjs';
 
 const TOKEN='KGAT_'+ 'dummy_personal_credential_1234567890';
@@ -125,3 +125,16 @@ test('custom GGUF URL is forwarded only to the personal bootstrap and other host
 test('a service that does not confirm the selected GGUF is stopped before model use',async()=>{const id='fixture-session-1234567890',calls=[],own={session_id:id,relay:RELAY_ORIGIN+'/_agent/'+id,key:'a'.repeat(64),owner:'alice',host:'kaggle',url:'https://www.kaggle.com/code/alice/qwen-agent-fixture',expires_at:new Date(Date.now()+3600000).toISOString()};await assert.rejects(createOwnKaggleSession({token:'KGAT_fixture_01234567890123456789',consent:true,modelUrl:'https://huggingface.co/example/model-GGUF',fetcher:async(url)=>{calls.push(url);return Response.json(url.endsWith('/v1/agent/sessions')?own:{ok:true});}}),/custom model launch could not be confirmed/);assert.equal(calls.length,2);assert.equal(calls[1],own.relay+'/v1/server/shutdown');});
 
 test('a confirmed custom GGUF source succeeds and its canonical URL is preserved',async()=>{const id='fixture-session-1234567890',source='https://huggingface.co/example/model-GGUF/blob/main/model-Q4_K_M.gguf';const profile={source_url:source,label:'Selected GGUF',context:16384,quant:'Q4_K_M',num_batch:128,profile_id:'hfgguf:'+'a'.repeat(24)};let calls=0;const own=await createOwnKaggleSession({token:'KGAT_fixture_01234567890123456789',consent:true,modelUrl:source.replace('/blob/','/resolve/')+'?download=true',fetcher:async(url,options)=>{calls++;assert.equal(JSON.parse(options.body).model_url,source);return Response.json({session_id:id,relay:RELAY_ORIGIN+'/_agent/'+id,key:'a'.repeat(64),owner:'alice',host:'kaggle',url:'https://www.kaggle.com/code/alice/qwen-agent-fixture',expires_at:new Date(Date.now()+3600000).toISOString(),model_profile:profile});}});assert.equal(own.model_profile.source_url,source);assert.equal(calls,1);});
+
+test('GPU quota is read from Kaggle with the personal token only, and unreadable answers are ignored',async()=>{
+  const token='KGAT_quota_fixture_0123456789';let seen;
+  const answer={quotaRefreshTime:'2026-11-21T00:00:00Z',gpuQuota:{timeUsed:'9331.603133600s',timeReserved:'600s',totalTimeAllowed:'108000s',minimumTimeAllowed:'108000s',hasEverRun:true},tpuQuota:{timeUsed:'0s',timeReserved:'0s',totalTimeAllowed:'72000s'}};
+  const quota=await readOwnGpuQuota({token,fetcher:async(url,options)=>{seen={url,options};return Response.json(answer);}});
+  assert.equal(seen.url,'https://api.kaggle.com/v1/kernels.KernelsApiService/GetAcceleratorQuotaStatistics');assert.equal(seen.options.headers.authorization,'Bearer '+token);assert.equal(seen.options.method,'POST');assert.equal(seen.options.redirect,'error');
+  assert.equal(quota.totalSeconds,108000);assert.equal(quota.reservedSeconds,600);assert.equal(Math.round(quota.remainingSeconds),98068);assert.equal(quota.refreshesAt,'2026-11-21T00:00:00.000Z');
+  assert.equal(describeGpuQuota(quota),'Kaggle GPU time left this week: 27 h 14 min of 30 h. It resets on 21 Nov.');
+  assert.equal(describeGpuQuota({totalSeconds:108000,remainingSeconds:0}),'Kaggle GPU time left this week: 0 min of 30 h.');
+  assert.equal((await readOwnGpuQuota({token,fetcher:async()=>Response.json({...answer,gpuQuota:{...answer.gpuQuota,timeUsed:'200000s'}})})).remainingSeconds,0);
+  for(const fetcher of [async()=>{throw new Error('offline');},async()=>new Response('{}',{status:403}),async()=>new Response('not json'),async()=>Response.json({}),async()=>Response.json({gpuQuota:{timeUsed:'1s',totalTimeAllowed:'0s'}}),async()=>Response.json({gpuQuota:{timeUsed:'soon',totalTimeAllowed:'108000s'}})])
+    assert.equal(await readOwnGpuQuota({token,fetcher}),null);
+});

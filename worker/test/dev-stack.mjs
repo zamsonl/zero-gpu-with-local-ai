@@ -99,12 +99,21 @@ export async function startStack({ port, mockPort, state, auth = "open", vars = 
     stateDir,
     /** Runs SQL on the stack's local D1 (works while wrangler dev is up); resolves to the result rows. */
     sql: async (command) => {
-      const stdout = await runWrangler(
-        ["d1", "execute", "qwen-chats", "--local", "--persist-to", stateDir, "--json", "--command", command],
-        stateDir,
-        output,
-      );
-      return JSON.parse(stdout).flatMap((statement) => statement.results ?? []);
+      // The running dev server holds this database open; a write of its own can make a
+      // one-off command fail as "busy". That is a retry, not a test failure.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const stdout = await runWrangler(
+            ["d1", "execute", "qwen-chats", "--local", "--persist-to", stateDir, "--json", "--command", command],
+            stateDir,
+            output,
+          );
+          return JSON.parse(stdout).flatMap((statement) => statement.results ?? []);
+        } catch (error) {
+          if (attempt >= 5 || !/SQLITE_BUSY|database is locked/i.test(String(error?.message))) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+        }
+      }
     },
     output: () => output.text(),
     stop,

@@ -8,7 +8,7 @@ import {randomBytes,timingSafeEqual} from 'node:crypto';
 import {launchOpenCode,openProjectFolder,openKaggleTokenPage,chooseBrowserChannel,recoveryNotebookUrl} from './opencode.mjs';
 import {cleanChildEnvironment,OPENCODE_VERSION,PLAYWRIGHT_MCP_VERSION} from './opencode-config.mjs';
 import {DEFAULT_CREDENTIAL_PATH,secureTokenStorageAvailable,forgetKaggleToken} from './credential-store.mjs';
-import {validateModelUrl} from './kaggle-session.mjs';
+import {validateModelUrl,readOwnGpuQuota} from './kaggle-session.mjs';
 import {chooseModernFolder} from './folder-picker.mjs';
 
 const HERE=path.dirname(fileURLToPath(import.meta.url));
@@ -17,13 +17,13 @@ const TITLES={idle:'Set up your coding workspace',checking:'Checking your local 
 export function safeSetupText(value){return String(value??'').replace(/\bKGAT_[A-Za-z0-9_-]+\b/g,'[redacted]').replace(/\b[a-f0-9]{64}\b/gi,'[redacted]').replace(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\S*/gi,'[private model connection]').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').slice(0,2000);}
 function failure(message,code='setup_error',status=400){return Object.assign(new Error(message),{code,status});}
 async function remembered(file=DEFAULT_CREDENTIAL_PATH){try{const s=await fs.lstat(file);return s.isFile()&&!s.isSymbolicLink()&&s.size>0&&s.size<=16384;}catch{return false;}}
-async function readPreferences(file){try{const stat=await fs.lstat(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>16384)return {};const v=JSON.parse(await fs.readFile(file,'utf8'));return {folder:typeof v.folder==='string'?v.folder.slice(0,32768):'',browser:v.browser!==false,modelUrl:typeof v.modelUrl==='string'?validateModelUrl(v.modelUrl):'',...(/^[A-Za-z0-9_-]{16,80}$/.test(v.pendingLaunch?.id||'')?{pendingLaunch:{id:v.pendingLaunch.id,modelUrl:validateModelUrl(v.pendingLaunch.modelUrl||'')}}:{})};}catch{return {};}}
+async function readPreferences(file){try{const stat=await fs.lstat(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>16384)return {};const v=JSON.parse(await fs.readFile(file,'utf8'));return {folder:typeof v.folder==='string'?v.folder.slice(0,32768):'',browser:v.browser!==false,resume:v.resume===true,modelUrl:typeof v.modelUrl==='string'?validateModelUrl(v.modelUrl):'',...(/^[A-Za-z0-9_-]{16,80}$/.test(v.pendingLaunch?.id||'')?{pendingLaunch:{id:v.pendingLaunch.id,modelUrl:validateModelUrl(v.pendingLaunch.modelUrl||'')}}:{})};}catch{return {};}}
 
 export async function createSetupController(deps={}){
   const preferenceFile=deps.preferenceFile||path.join(os.homedir(),'.qwen','setup-preferences.json');
   const preferences=await readPreferences(preferenceFile);
   let pendingLaunch=preferences.pendingLaunch||null;
-  let state={phase:'idle',title:TITLES.idle,detail:pendingLaunch?'An earlier launch needs confirmation. Check the same saved launch before starting another notebook.':'Choose your project, connect Kaggle, then open OpenCode.',retrySameLaunch:!!pendingLaunch,folder:preferences.folder||'',browser:preferences.browser!==false,modelUrl:preferences.modelUrl||'',rememberedToken:await (deps.hasRememberedToken||remembered)(),secureStorageAvailable:secureTokenStorageAvailable(),canRetry:true,running:false,events:[],error:null};
+  let state={phase:'idle',title:TITLES.idle,detail:pendingLaunch?'An earlier launch needs confirmation. Check the same saved launch before starting another notebook.':'Choose your project, connect Kaggle, then open OpenCode.',retrySameLaunch:!!pendingLaunch,folder:preferences.folder||'',browser:preferences.browser!==false,resume:preferences.resume===true,modelUrl:preferences.modelUrl||'',rememberedToken:await (deps.hasRememberedToken||remembered)(),secureStorageAvailable:secureTokenStorageAvailable(),canRetry:true,running:false,events:[],error:null};
   let sequence=0,active=false,abort=null,launch=null,work=null,closed=false,uncertain=false,pickerAbort=null,lastProgress='';const listeners=new Map();
   const snapshot=()=>structuredClone(state);
   const publish=()=>{for(const [listener,needsSnapshot] of listeners){try{listener(needsSnapshot?snapshot():undefined);}catch{}}};
@@ -43,7 +43,7 @@ export async function createSetupController(deps={}){
     if(typeof value.notebookUrl==='string'&&/^https:\/\/www\.kaggle\.com\/code\/[A-Za-z0-9_/-]+$/.test(value.notebookUrl))patch.notebookUrl=value.notebookUrl;
     set(patch);const key=JSON.stringify([value.stage,value.state,detail,value.line||'',value.percent??null,value.connection||null,value.source||null]);if(key===lastProgress)return;lastProgress=key;event(value.line||detail,{stage:value.stage,level:value.state==='error'?'error':'info',source:value.source});
   };
-  const savePreferences=async()=>{await fs.mkdir(path.dirname(preferenceFile),{recursive:true});const temporary=preferenceFile+'.'+randomBytes(8).toString('hex')+'.tmp';try{await fs.writeFile(temporary,JSON.stringify({version:1,folder:state.folder,browser:state.browser,modelUrl:state.modelUrl,...(pendingLaunch?{pendingLaunch}:{})})+'\n',{flag:'wx',mode:0o600});await fs.rename(temporary,preferenceFile);}finally{await fs.rm(temporary,{force:true}).catch(()=>{});}};
+  const savePreferences=async()=>{await fs.mkdir(path.dirname(preferenceFile),{recursive:true});const temporary=preferenceFile+'.'+randomBytes(8).toString('hex')+'.tmp';try{await fs.writeFile(temporary,JSON.stringify({version:1,folder:state.folder,browser:state.browser,resume:state.resume===true,modelUrl:state.modelUrl,...(pendingLaunch?{pendingLaunch}:{})})+'\n',{flag:'wx',mode:0o600});await fs.rename(temporary,preferenceFile);}finally{await fs.rm(temporary,{force:true}).catch(()=>{});}};
   const controller={
     snapshot,subscribe(fn,{snapshot:needsSnapshot=true}={}){listeners.set(fn,needsSnapshot);return()=>listeners.delete(fn);},get busy(){return active;},get work(){return work;},get running(){return state.running;},
     async folder(input={}){if(active||pickerAbort)throw failure('Stop the current setup before changing its project.','setup_busy',409);pickerAbort=new AbortController();try{if(input.path!==undefined&&(typeof input.path!=='string'||input.path.length>32768))throw failure('Choose an existing project folder.');const selected=input.path?.trim()||await(deps.chooseFolder||chooseModernFolder)({initialFolder:state.folder,signal:deps.signal?AbortSignal.any([deps.signal,pickerAbort.signal]):pickerAbort.signal});if(!selected||pickerAbort.signal.aborted)return {folder:state.folder,cancelled:true};const folder=await(deps.openFolder||openProjectFolder)(selected);set({folder});await savePreferences();return {folder,cancelled:false};}finally{pickerAbort=null;}},
@@ -53,7 +53,7 @@ export async function createSetupController(deps={}){
     start(input){
       if(closed||active||pickerAbort)throw failure('A setup or coding session is already active.','setup_busy',409);
       if(!input||typeof input!=='object'||Array.isArray(input))throw failure('Supply your setup choices.');
-      for(const key of Object.keys(input))if(!['folder','token','rememberToken','browser','installConsent','gpuConsent','modelUrl','confirmDeletedNotebooks'].includes(key))throw failure('Unsupported setup choice.');
+      for(const key of Object.keys(input))if(!['folder','token','rememberToken','browser','resume','installConsent','gpuConsent','modelUrl','confirmDeletedNotebooks'].includes(key))throw failure('Unsupported setup choice.');
       if(input.confirmDeletedNotebooks!==undefined&&typeof input.confirmDeletedNotebooks!=='boolean')throw failure('Confirm deleted notebooks using the recovery checkbox.','invalid_recovery_confirmation');
       if(input.confirmDeletedNotebooks===true&&(!pendingLaunch||state.error?.code!=='personal_notebook_inaccessible'||state.error.canConfirmDeleted!==true||!recoveryNotebookUrl(state.error.notebookUrl)))throw failure('Check the same launch first. Recovery is available only for the inaccessible old notebook shown in setup.','recovery_not_available',409);
       if(typeof input.folder!=='string'||!input.folder.trim()||input.folder.length>32768)throw failure('Choose an existing project folder.','folder_required');
@@ -67,8 +67,8 @@ export async function createSetupController(deps={}){
       const retrying=!!pendingLaunch;set({retrySameLaunch:retrying});
       pendingLaunch??={id:randomBytes(16).toString('hex'),modelUrl};
       lastProgress='';active=true;uncertain=false;abort=new AbortController();let blockedInstall=false;
-      set({phase:'checking',title:TITLES.checking,detail:'Validating the selected project and reviewed local tools.',folder:input.folder.trim(),modelUrl,browser:input.browser!==false,running:false,canRetry:false,error:null,notebookUrl:null,owner:null,percent:null,startedAt:new Date().toISOString(),endedAt:null});event('Setup started. GPU usage requires your confirmed personal account.');
-      const args=['--setup','--launch-id',pendingLaunch.id,'--folder',state.folder,...(modelUrl?['--model-url',modelUrl]:[]),...(!state.browser?['--no-browser']:[]),...(input.rememberToken===false?['--no-remember-token']:[]),...(input.confirmDeletedNotebooks===true?['--confirm-deleted-notebooks']:[])];
+      set({phase:'checking',title:TITLES.checking,detail:'Validating the selected project and reviewed local tools.',folder:input.folder.trim(),modelUrl,browser:input.browser!==false,resume:input.resume===true,running:false,canRetry:false,error:null,notebookUrl:null,owner:null,percent:null,startedAt:new Date().toISOString(),endedAt:null});event('Setup started. GPU usage requires your confirmed personal account.');
+      const args=['--setup','--launch-id',pendingLaunch.id,'--folder',state.folder,...(modelUrl?['--model-url',modelUrl]:[]),...(!state.browser?['--no-browser']:[]),...(state.resume?['--continue']:[]),...(input.rememberToken===false?['--no-remember-token']:[]),...(input.confirmDeletedNotebooks===true?['--confirm-deleted-notebooks']:[])];
       work=(async()=>{
         try{
           // Persist the non-secret identity before any remote launch. Explicit
@@ -76,7 +76,7 @@ export async function createSetupController(deps={}){
           await savePreferences();
           if(retrying)event('Retrying the saved launch reference. The connector checks the same notebook before any new allocation.');
           const folder=await(deps.openFolder||openProjectFolder)(state.folder);set({folder});args[args.indexOf('--folder')+1]=folder;await savePreferences();
-          const launchDeps={...deps.launchDependencies,isInteractive:()=>true,signal:abort.signal,log:line=>event(line),onProgress:progress,
+          const launchDeps={...deps.launchDependencies,isInteractive:()=>true,signal:abort.signal,log:line=>event(line),onProgress:progress,readQuota:deps.readQuota||readOwnGpuQuota,
             askSetup:async question=>{if(!question.startsWith('Install the missing reviewed local tools:'))return false;blockedInstall=input.installConsent!==true;return !blockedInstall;},
             promptToken:async()=>token,confirmUsage:async()=>input.gpuConsent===true,
             ...(token?{loadSavedToken:async()=>null}:{}),
