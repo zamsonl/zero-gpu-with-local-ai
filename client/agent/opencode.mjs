@@ -291,6 +291,9 @@ function pauseUntilPoll(ms,signal){
   });
 }
 
+// Every start submits a new private notebook, so finished ones collect in the account.
+export const NOTEBOOK_CLEANUP_HINT='Each start creates a new private notebook named qwen-agent-…; finished ones use no GPU time. Delete old ones on Kaggle under Your Work → Code when you no longer need them.';
+
 export async function waitForOwnReady(session,{signal,log=console.log,onProgress,probeNotebook,onReady,request=ownCloudRequest,pause=pauseUntilPoll,now=Date.now,timeoutMs=OPEN_CODE_REQUEST_TIMEOUT_MS,pollMs=5000}={}){
   const start=now(),secrets=[session?.key];let reported='',lastReport=0,lastBootAt=-Infinity,lastLogPoll=-Infinity,lastQueueProbe=-Infinity,queueResult=null,queueDiagnostic='';
   let current={stage:'connecting',detail:'Waiting for the notebook to report its startup stage.'};const seenLines=new Set();
@@ -562,10 +565,10 @@ async function launchOpenCodeInner(args,dependencies,context){
     catch{failed=true;log('Could not stop the local personal-session heartbeat.');}
     try{if(terminate&&child)await(dependencies.terminateChild||terminateOwnedChild)(child);}
     catch{failed=true;log('Could not confirm the local OpenCode process stopped.');}
-    try{await shutdown();shutdownRequested=true;log('Shutdown requested for your personal Kaggle notebook. Check Kaggle to confirm it stopped.');}
+    try{await shutdown();shutdownRequested=true;log('Shutdown requested for your personal Kaggle notebook. Check Kaggle to confirm it stopped.');log(NOTEBOOK_CLEANUP_HINT);}
     catch{failed=true;log('Could not confirm notebook shutdown. Stop the qwen-agent notebook from your own Kaggle account.');}
     try{await runtime?.cleanup();}catch{failed=true;log('Could not remove the temporary OpenCode session directory.');}
-    const result={...exit,code:failed?1:exit.code};stage('stopped',failed?'error':'complete',failed?'Personal session cleanup could not be fully confirmed. Check the notebook in Kaggle.':'Shutdown requested. Your local conversation remains saved.');finish(result);return result;
+    const result={...exit,code:failed?1:exit.code};stage('stopped',failed?'error':'complete',failed?'Personal session cleanup could not be fully confirmed. Check the notebook in Kaggle.':'Shutdown requested. Your local conversation remains saved. '+NOTEBOOK_CLEANUP_HINT);finish(result);return result;
   });
   if(cancelled()){await close();return null;}
   try{
