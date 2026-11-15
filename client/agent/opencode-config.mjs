@@ -63,7 +63,8 @@ export function createOpenCodeConfig(session,{browserCommand,privatePaths=[]}={}
       npm:'@ai-sdk/openai-compatible',name:custom?'Your private Kaggle model':'Your private Kaggle Qwen',
       options:{baseURL:own.relay+'/v1',apiKey:'{env:'+RELAY_KEY_ENV+'}',timeout:OPEN_CODE_TRANSPORT_TIMEOUT_MS},
       models:{[MODEL_ID]:{
-        name:profile?.label||'Qwen 27B · your Kaggle GPU',tool_call:true,attachment:false,reasoning:thinks,
+        // OpenCode shows this label beside the prompt for the whole session, so it carries the shortcut.
+        name:(profile?.label||'Qwen 27B')+(thinks?' · Ctrl+T: thinking mode':custom?'':' · your Kaggle GPU'),tool_call:true,attachment:false,reasoning:thinks,
         interleaved:{field:'reasoning_content'},options:{reasoningEffort:'medium'},
         ...(thinks?{variants:Object.fromEntries(Object.entries(THINKING_MODES).map(([mode,reasoningEffort])=>[mode,{reasoningEffort}]))}:{}),
         modalities:{input:['text'],output:['text']},limit:{context:capacity,input:capacity,output:custom?Math.min(4096,Math.floor(capacity/4)):16384},

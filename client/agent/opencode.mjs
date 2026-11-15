@@ -588,12 +588,14 @@ async function launchOpenCodeInner(args,dependencies,context){
     log('Edits, shell commands and browser actions ask for approval. Exit OpenCode or press Ctrl+C to request notebook shutdown.');
     log('The connector keeps your personal notebook online while this window is open. Requests may run for up to two hours; Kaggle runtime and quota limits still apply.');
     const resume=options['--continue']?['--continue']:options['--session']?['--session',options['--session']]:[];
+    // OpenCode's own title updates are off, so this window title stays up as a reminder.
+    if(!dependencies.spawnProcess&&session.model_profile?.thinking!==false){try{process.title='Heretic Qwen · Ctrl+T changes thinking mode (fast, light, normal, deep)';}catch{}}
     child=(dependencies.spawnProcess||spawn)(invocation.command,[...invocation.args,folder,'--model',MODEL,'--agent','build',...resume],{cwd:folder,env:runtime.env,stdio:'inherit',shell:false,windowsHide:false});
     child.once('close',(code,signal)=>{exit={code:Number.isInteger(code)?code:signal?1:0,signal};void close({terminate:false}).catch(()=>{});});
     child.once('error',()=>{exit={code:1,signal:null};log('OpenCode could not start. Check its pinned installation.');stage('running','error','OpenCode could not start. Check its pinned installation.');void close({terminate:false}).catch(()=>{});});
     dependencies.signal?.addEventListener('abort',onAbort,{once:true});
     if(cancelled())onAbort();
-    else stage('running','complete','OpenCode opened in your selected project.',{owner:session.owner,notebookUrl:session.url,folder});
+    else stage('running','complete','OpenCode opened in your selected project.'+(session.model_profile?.thinking===false?'':' Press Ctrl+T there to change the thinking mode: fast, light, normal or deep.'),{owner:session.owner,notebookUrl:session.url,folder});
     return {child,session,runtimeDirectory:runtime.directory,historyDirectory:runtime.historyDirectory,close,done};
   }catch(error){
     context.secrets.delete(startupToken);startupToken='';

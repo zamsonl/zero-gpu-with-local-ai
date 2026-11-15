@@ -29,7 +29,7 @@ Review any tool approval before accepting it. The configured model is `personal-
 
 ## Visible thinking and long work
 
-**Thinking modes.** Press **Ctrl+T** inside OpenCode to cycle the mode, or type `/variants` to pick one from a list.
+**Thinking modes.** Press **Ctrl+T** inside OpenCode to cycle the mode, or type `/variants` to pick one from a list. Three reminders show the shortcut: the window title, the model label beside the prompt, and the setup window once OpenCode has opened.
 
 | Mode | What Qwen does | Use it for |
 |---|---|---|

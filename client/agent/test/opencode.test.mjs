@@ -29,6 +29,8 @@ test('the generated config allows only personal Qwen for every AI role and state
   assert.equal(provider.models[MODEL_ID].tool_call,true);assert.equal(provider.models[MODEL_ID].attachment,false);
   assert.equal(provider.models[MODEL_ID].reasoning,true);assert.deepEqual(provider.models[MODEL_ID].interleaved,{field:'reasoning_content'});
   assert.equal(provider.models[MODEL_ID].options.reasoningEffort,'medium');assert.equal(OPEN_CODE_REQUEST_TIMEOUT_MS,2*60*60*1000);
+  // The model label OpenCode shows beside the prompt carries the shortcut.
+  assert.equal(provider.models[MODEL_ID].name,'Qwen 27B · Ctrl+T: thinking mode');
   // Ctrl+T in OpenCode cycles these thinking modes; none chosen behaves like normal.
   assert.deepEqual(provider.models[MODEL_ID].variants,{fast:{reasoningEffort:'none'},light:{reasoningEffort:'low'},normal:{reasoningEffort:'medium'},deep:{reasoningEffort:'high'}});
   assert.equal(createOpenCodeConfig({...own,model_profile:{label:'Selected GGUF',context:8192,quant:'Q4_K_M',num_batch:128,profile_id:'hfgguf:'+'a'.repeat(24),thinking:false}}).provider[PROVIDER_ID].models[MODEL_ID].variants,undefined);
