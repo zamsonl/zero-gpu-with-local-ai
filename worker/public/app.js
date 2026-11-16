@@ -28,6 +28,14 @@ const RESUME_FOLLOW_PX = 8;
 let lastScrollTop = 0;
 const MAX_AUTOMATIC_CONTINUES = 8;
 const MAX_AUTOMATIC_WORK_MS = 12 * 60 * 1000;
+// An answer cut at its length limit carries on by itself as the same reply, this many times.
+const MAX_AUTOMATIC_ANSWER_PARTS = 6;
+// A reply whose connection dropped is picked up again by itself, this many times per message.
+const MAX_AUTOMATIC_RECONNECTS = 6;
+// Failed attempts to reach the relay before giving up (timers pause while a laptop sleeps, so
+// this is waking time: about half an hour), and the longest wait between two attempts.
+const MAX_RECONNECT_ATTEMPTS = 120;
+const RECONNECT_WAIT_MS = 15_000;
 // Preserve an idempotency identity when an upload's acknowledgement is lost.
 let pendingLongUpload = null;
 
@@ -497,7 +505,12 @@ async function send(text, { replaceFrom = null, attachments = [], draftSnapshot 
   try {
     for await (const event of api.turn(chat.id, body, abort.signal)) handleEvent(generation, event);
     if (generation.checkpoint || generation.answerTarget) await continueCheckpoint(generation, think);
-    if (!generation.finished) view.finish(null, { errorText: "The connection closed before the reply finished." });
+    // The stream ended without a final event: treat it like a dropped connection.
+    if (!generation.finished && generation.started && await recoverDroppedReply(generation)) await continueCheckpoint(generation, think);
+    if (!generation.finished) {
+      if (abort.signal.aborted) view.markStopped();
+      else view.finish(generation.droppedMessage ?? null, { errorText: "The connection closed before the reply finished." });
+    }
   } catch (err) {
     if (abort.signal.aborted) {
       if (generation.started) view.markStopped();
@@ -507,8 +520,14 @@ async function send(text, { replaceFrom = null, attachments = [], draftSnapshot 
     } else if (!generation.started) {
       rollBack(generation, text);
       showNotice(describeSendError(err));
-    } else {
-      view.finish(null, { errorText: "The connection to the relay dropped. The partial reply was saved." });
+    } else if (await recoverDroppedReply(generation)) {
+      // Lid closed or Wi-Fi dropped mid-reply: the relay is back and the reply is saved, so carry on.
+      await continueCheckpoint(generation, think);
+      if (!generation.finished) view.finish(null, { errorText: "The connection closed before the reply finished." });
+    } else if (abort.signal.aborted) {
+      view.markStopped();
+    } else if (!generation.finished) {
+      view.finish(generation.droppedMessage ?? null, { errorText: "The connection to the relay dropped. The partial reply was saved." });
     }
   } finally {
     state.generation = null;
@@ -692,6 +711,12 @@ function handleEvent(generation, event) {
       break;
     case "done":
       generation.checkpoint = null;
+      // An answer cut at its length limit is continued by itself, in the same message.
+      if (lengthCutAnswer(generation, event)) {
+        generation.checkpoint = event.message;
+        generation.checkpointId = event.message.id;
+        generation.freeContinue = "answer";
+      }
       if (generation.answerRequested && !generation.answerPass && ['length','stopped','error'].includes(event.message?.status) && event.message?.id && (event.message.thinking || event.message.content)) generation.answerTarget = event.message;
       generation.finished = true;
       view.finish(event.message);
@@ -783,16 +808,21 @@ async function continueCheckpoint(generation, think) {
     const signature = JSON.stringify([saved.content, saved.thinking, saved.stats?.recovery?.through_chars, saved.stats?.recovery?.notes]);
     generation.staleCheckpoints = generation.checkpointSignature === signature ? (generation.staleCheckpoints ?? 0) + 1 : 0;
     generation.checkpointSignature = signature;
-    const finishNow = generation.answerRequested || (generation.automaticContinues ?? 0) >= MAX_AUTOMATIC_CONTINUES
-      || Date.now() - generation.workStartedAt >= MAX_AUTOMATIC_WORK_MS || generation.staleCheckpoints >= 2;
-    if (generation.answerPass) {
+    // An answer that is being written, or a reply resumed after a dropped connection, is not
+    // more unprompted thinking: the count and time limits on automatic work do not apply to it.
+    const free = generation.freeContinue ?? null;
+    generation.freeContinue = null;
+    const finishNow = generation.answerRequested || (!free && ((generation.automaticContinues ?? 0) >= MAX_AUTOMATIC_CONTINUES
+      || Date.now() - generation.workStartedAt >= MAX_AUTOMATIC_WORK_MS)) || (free !== "reconnect" && generation.staleCheckpoints >= 2);
+    if (generation.answerPass && !free) {
       view.finish(saved, { errorText: 'The answer-only pass could not complete safely. Your work remains saved. Check the connection before retrying.' });
       generation.finished = true;
       return;
     }
     const effort = finishNow ? false : think;
     if (finishNow) generation.answerPass = true;
-    generation.automaticContinues = (generation.automaticContinues ?? 0) + 1;
+    if (free === "answer") generation.answerParts = (generation.answerParts ?? 0) + 1;
+    else if (!free) generation.automaticContinues = (generation.automaticContinues ?? 0) + 1;
     generation.checkpoint = null;
     generation.answerTarget = null;
     generation.finished = false;
@@ -800,7 +830,10 @@ async function continueCheckpoint(generation, think) {
     generation.betweenRequests = true;
     syncAnswerNow(generation);
     view.resume({ thinking: effort !== false });
-    view.setStatus({ state: 'recovering', detail: finishNow ? 'Finishing the answer from saved work without more thinking.' : `Continuing from saved progress (${generation.automaticContinues}/${MAX_AUTOMATIC_CONTINUES})` });
+    view.setStatus({ state: 'recovering', detail: finishNow ? 'Finishing the answer from saved work without more thinking.'
+      : free === 'reconnect' ? 'Connection restored. Continuing the reply from where it was saved.'
+      : free === 'answer' ? `The reply reached its length limit. Continuing it automatically (part ${generation.answerParts + 1}).`
+      : `Continuing from saved progress (${generation.automaticContinues}/${MAX_AUTOMATIC_CONTINUES})` });
     announce('Continuing from saved progress');
     try {
       for await (const event of api.continueReply(chatId, abort.signal, effort)) {
@@ -828,14 +861,18 @@ async function continueCheckpoint(generation, think) {
         return;
       }
       if (!generation.finished) {
-        // A dropped stream is not a work checkpoint and must never start more
-        // inference automatically. Keep the known durable Continue target.
-        view.finish(saved, { errorText: 'The connection closed. Saved progress is available through Continue.' });
+        // A dropped stream is not a work checkpoint. More inference starts only after the
+        // server confirms this reply is saved and that nothing is still writing it.
+        if (await recoverDroppedReply(generation)) continue;
+        if (!generation.finished) view.finish(generation.droppedMessage ?? saved, { errorText: 'The connection closed. Saved progress is available through Continue.' });
         generation.finished = true;
         return;
       }
     } catch (error) {
       if (abort.signal.aborted || generation.stopped) view.markStopped();
+      else if (connectionDropped(error) && generation.started && await recoverDroppedReply(generation)) continue;
+      else if (abort.signal.aborted) view.markStopped();
+      else if (generation.finished) { /* the reply had already finished on the server */ }
       else {
         view.finish(saved, { errorText: 'Automatic continuation could not finish. Saved progress is available through Continue.' });
         if (canContinueCheckpoint(generation)) showNotice('Could not continue automatically. Your progress is saved; use Continue when you are ready.');
@@ -845,6 +882,109 @@ async function continueCheckpoint(generation, think) {
       return;
     }
   }
+}
+
+/** An answer (not reasoning) that stopped only because the reply reached its length limit. */
+function lengthCutAnswer(generation, event) {
+  const message = event.message;
+  return message?.status === "length" && !event.stopped_by && Boolean(message.content) && Number.isSafeInteger(message.id)
+    && !generation.stopped && !generation.answerRequested && !generation.longInput
+    && (generation.answerParts ?? 0) < MAX_AUTOMATIC_ANSWER_PARTS;
+}
+
+/** A failed request or a stream that broke, as opposed to an answer the relay gave. */
+function connectionDropped(error) {
+  return !(error instanceof ApiError) || error.code === "network";
+}
+
+/** Resolves after `ms`, or sooner when the browser reports the network is back or `signal` aborts. */
+function waitToRetry(ms, signal) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      window.removeEventListener("online", done);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    window.addEventListener("online", done, { once: true });
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** Puts the server's saved copy of this page's reply into the chat's message list. */
+function adoptSavedReply(generation, saved) {
+  if (state.chat?.id !== generation.chatId) return;
+  state.messages = state.messages.some((message) => message.id === saved.id)
+    ? state.messages.map((message) => (message.id === saved.id ? saved : message))
+    : [...state.messages, saved];
+  telemetry.setChat(state.messages);
+}
+
+/**
+ * The connection broke while this page was receiving a reply (lid closed, Wi-Fi drop). Waits for
+ * the relay, then asks the server what became of the reply. While the server is still writing it,
+ * its progress is shown here. Once it is saved and nothing holds the GPU, the saved reply becomes
+ * the point to continue from. Resolves to true when the caller should continue it; a reply that
+ * finished on the server meanwhile is shown as finished (`generation.finished`).
+ */
+async function recoverDroppedReply(generation) {
+  const { view, abort, chatId } = generation;
+  if (generation.longInput || generation.stopped) return false;
+  generation.reconnects = (generation.reconnects ?? 0) + 1;
+  if (generation.reconnects > MAX_AUTOMATIC_RECONNECTS) return false;
+  // No request of this page is open while it waits, so Stop only has to end the wait.
+  generation.betweenRequests = true;
+  syncAnswerNow(generation);
+  view.setStatus({ state: "recovering", detail: "Connection lost. Waiting for the network to come back." });
+  announce("Connection lost. Waiting to reconnect");
+  let failures = 0;
+  while (failures < MAX_RECONNECT_ATTEMPTS) {
+    if (!canContinueCheckpoint(generation)) return false;
+    let wait = Math.min(1000 * 2 ** Math.min(failures, 4), RECONNECT_WAIT_MS);
+    try {
+      const live = await api.live(chatId, abort.signal);
+      if (live) {
+        // Reachable again, and the server is still writing this reply: show its progress.
+        view.sync(live);
+        failures = 0;
+        wait = 1500;
+      } else {
+        const { messages } = await api.getChat(chatId, abort.signal);
+        const saved = messages.at(-1);
+        const mine = saved?.role === "assistant"
+          && (generation.checkpointId ? saved.id === generation.checkpointId : saved.id > (generation.pendingUser?.id ?? Infinity));
+        if (mine && saved.status === "complete") {
+          adoptSavedReply(generation, saved);
+          view.finish(saved);
+          generation.finished = true;
+          announce("Reply finished");
+          return false;
+        }
+        // Nothing of this reply was saved: there is nothing to carry on from.
+        if (!mine || !["stopped", "error", "length"].includes(saved.status) || !(saved.content || saved.thinking)) return false;
+        if ((await api.status(abort.signal)).busy) {
+          // Something still holds the GPU (the old request is closing, or another device): wait.
+          failures++;
+        } else {
+          adoptSavedReply(generation, saved);
+          view.finish(saved);
+          generation.droppedMessage = saved;
+          generation.checkpoint = saved;
+          generation.checkpointId = saved.id;
+          generation.freeContinue = "reconnect";
+          generation.finished = false;
+          return true;
+        }
+      }
+    } catch (error) {
+      if (abort.signal.aborted || !connectionDropped(error)) return false;
+      failures++;
+      view.setStatus({ state: "recovering", detail: `Connection lost. Trying to reconnect (attempt ${failures + 1}).` });
+    }
+    await waitToRetry(wait, abort.signal);
+  }
+  return false;
 }
 
 /** Undo the optimistic bubbles when the server never accepted the message; keep what was typed. */
@@ -934,7 +1074,12 @@ async function continueReply(message, view, think = composer.think ?? true) {
       }
     }
     if (generation.checkpoint || generation.answerTarget) await continueCheckpoint(generation, think);
-    if (!generation.finished) view.finish(null, { errorText: "The connection closed before the reply finished." });
+    // The stream ended without a final event: treat it like a dropped connection.
+    if (!generation.finished && generation.started && await recoverDroppedReply(generation)) await continueCheckpoint(generation, think);
+    if (!generation.finished) {
+      if (abort.signal.aborted) view.markStopped();
+      else view.finish(generation.droppedMessage ?? null, { errorText: "The connection closed before the reply finished." });
+    }
   } catch (err) {
     if (abort.signal.aborted) view.markStopped();
     else if (generation.checkpoint) view.finish(generation.checkpoint, { errorText: 'Saved progress is available through Continue. Automatic continuation stopped after a connection error.' });
@@ -942,7 +1087,11 @@ async function continueReply(message, view, think = composer.think ?? true) {
       // Refused before it began (busy, offline): put the reply back as it was.
       view.finish(message);
       showNotice(describeSendError(err));
-    } else view.finish(null, { errorText: "The connection to the relay dropped. What was added was saved." });
+    } else if (await recoverDroppedReply(generation)) {
+      await continueCheckpoint(generation, think);
+      if (!generation.finished) view.finish(null, { errorText: "The connection closed before the reply finished." });
+    } else if (abort.signal.aborted) view.markStopped();
+    else if (!generation.finished) view.finish(generation.droppedMessage ?? null, { errorText: "The connection to the relay dropped. What was added was saved." });
   } finally {
     state.generation = null;
     syncAnswerNow();
