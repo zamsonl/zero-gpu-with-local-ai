@@ -9,8 +9,9 @@ import {streamTiming} from '../src/chat-stream.js';
 
 test('the configured per-request limits leave room for the longest allowed reply',()=>{
   const config=fs.readFileSync(new URL('../wrangler.toml',import.meta.url),'utf8');
-  const limits=config.split(/^\[limits\][ \t]*\r?$/m)[1]?.split(/^\[/m)[0]??'';
-  const read=name=>{const match=new RegExp('^'+name+'[ \\t]*=[ \\t]*(\\d+)','m').exec(limits);return match?Number(match[1]):0;};
+  // The section is active in a deployment's own config; a settings template may leave it commented out.
+  const limits=config.split(/^#?[ \t]*\[limits\][ \t]*\r?$/m)[1]?.split(/^\[/m)[0]??'';
+  const read=name=>{const match=new RegExp('^#?[ \\t]*'+name+'[ \\t]*=[ \\t]*(\\d+)','m').exec(limits);return match?Number(match[1]):0;};
   const longest=streamTiming().jobMs;
   // While a reply streams, the Worker checks for Stop, mirrors the reply for other devices and renews its lock.
   const calls=longest/STOP_POLL_MS+longest/FLUSH_MS+longest/LOCK_HEARTBEAT_MS;
