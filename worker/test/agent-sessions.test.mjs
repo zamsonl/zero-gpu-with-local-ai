@@ -239,7 +239,7 @@ functions={node.name:node for node in tree.body if isinstance(node,(ast.Function
 shared=[node for node in tree.body if isinstance(node,ast.Assign) and any(getattr(target,'id',None) in ('STOP_REASONS','REPLACED_AFTER_401S','TUNNEL_GIVE_UP_S','CURRENT_TARGET','SIGNED_OFF') for target in node.targets)]
 logs=[]
 def forbidden(): raise AssertionError('Cancelled notebook reached model/runtime setup')
-namespace={'RUNTIME_HOST':'kaggle','RELAY_HEADER':'x-launch-token','NotebookLogReporter':lambda *a,**k:object(),'RELAY':'owned','LAUNCH_TOKEN':'owned','time':time,'AGENT_ONLY':True,'log':logs.append,'relay':lambda *a,**k:{'shutdown':True},'models_dir':forbidden}
+namespace={'RUNTIME_HOST':'kaggle','RELAY_HEADER':'x-launch-token','NotebookLogReporter':lambda *a,**k:object(),'RELAY':'owned','LAUNCH_TOKEN':'owned','WEB_KEY':'k'*43,'WEB_ROUTES':False,'time':time,'AGENT_ONLY':True,'log':logs.append,'relay':lambda *a,**k:{'shutdown':True},'models_dir':forbidden}
 exec(compile(ast.Module(body=[functions['main']],type_ignores=[]),'personal-main-fixture','exec'),namespace)
 namespace['main']()
 assert any('cancelled before startup' in line for line in logs)
@@ -256,7 +256,7 @@ def relay(method,path,body=None):
     calls.append((method,path))
     if method=='GET': raise RuntimeError('Relay unavailable')
     return {}
-namespace={'RUNTIME_HOST':'kaggle','time':clock,'urllib':urllib,'AGENT_ONLY':True,'PICTURES':pictures,'BATCH_SIZE':256,'PROFILE_ID':'personal','relay':relay,'report':lambda *a,**k:None,'log':logs.append,'public':lambda text:str(text)[:180],'requests_served':lambda:0,'gpu_busy':lambda:False,'STARTED':0,'MAX_RUNTIME_S':24000,'IMAGE_POLL_S':2,'CHAT_POLL_S':10,'TUNNEL_CHECK_S':30}
+namespace={'RUNTIME_HOST':'kaggle','time':clock,'urllib':urllib,'AGENT_ONLY':True,'PICTURES':pictures,'BATCH_SIZE':256,'PROFILE_ID':'personal','relay':relay,'report':lambda *a,**k:None,'log':logs.append,'public':lambda text:str(text)[:180],'requests_served':lambda:0,'gpu_busy':lambda:False,'STARTED':0,'MAX_RUNTIME_S':24000,'IMAGE_POLL_S':2,'CHAT_POLL_S':10,'TUNNEL_CHECK_S':30,'WEB_ROUTES':False}
 exec(compile(ast.Module(body=[*shared,functions['Stop'],functions['unauthorized'],functions['sign_off'],functions['serve']],type_ignores=[]),'personal-serve-fixture','exec'),namespace)
 namespace['serve'](98304,False,'Q5_K_P','owned-target')
 assert pictures.stopped

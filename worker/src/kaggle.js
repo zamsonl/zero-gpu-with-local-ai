@@ -17,6 +17,7 @@ import SERVER_SCRIPT from "./kaggle-server.py";
 import CACHE_HELPERS from "./kaggle-cache.py";
 import STREAM_PROXY from "./kaggle-stream-proxy.py";
 import ASYNC_JOBS from "./kaggle-jobs.py";
+import WEB_ROUTES from "./kaggle-web.py";
 import NOTEBOOK_LOG from "./notebook-log.py";
 import { settings } from "./config.js";
 import { HttpError, json } from "./http.js";
@@ -173,7 +174,7 @@ export function serverScript({ relay, token, quant, contexts = CONTEXTS, vision 
     script=script.replace(marker,()=>`CUSTOM_MODEL_SPEC = json.loads(${JSON.stringify(JSON.stringify(modelSpec))})\n${CUSTOM_MODEL_RUNTIME}\n${marker}`);
   }
   if(personalCacheSpec){if(!agentOnly)throw new Error('Personal cache requires an isolated session.');script=script.replace('if __name__ == "__main__":',()=>personalCacheRuntimeScript(personalCacheSpec)+'\nif __name__ == "__main__":');}
-  return `${CACHE_HELPERS}\n\n${STREAM_PROXY}\n\n${ASYNC_JOBS}\n\n${NOTEBOOK_LOG}\n\n${script}`;
+  return `${CACHE_HELPERS}\n\n${STREAM_PROXY}\n\n${ASYNC_JOBS}\n\n${WEB_ROUTES}\n\n${NOTEBOOK_LOG}\n\n${script}`;
 }
 
 /**

@@ -21,7 +21,7 @@ import {prepareChatPlan,recoverReasoning,thinkingWorkBody,interruptedWorkCode,is
 import {chatRequestBody,continuationPrompt} from './prompt.js';
 import {requireChat} from './chats.js';
 import {phaseStatus,withTransportProgress} from '../public/js/progress-status.js';
-import { MAX_WEB_CALLS, MAX_WEB_ROUNDS, MIN_TOOL_ROOM_CHARS, PAGE_TEXT_CHARS, WEB_ROUND_RESERVE, WEB_TOOLS, WebBudgetError, emptyWebRecord, isToolParseError, readToolCall, runWebTool, trimmedThinking, webNotes, webStatus, withWebGuidance } from "./web-tools.js";
+import { MAX_WEB_CALLS, MAX_WEB_ROUNDS, MIN_TOOL_ROOM_CHARS, PAGE_TEXT_CHARS, WEB_ROUND_RESERVE, WEB_TOOLS, WebBudgetError, emptyWebRecord, isToolParseError, notebookFetch, readToolCall, runWebTool, trimmedThinking, webNotes, webStatus, withWebGuidance } from "./web-tools.js";
 
 class ClientGone extends Error {}
 class StopRequested extends Error {}
@@ -209,7 +209,10 @@ async function generate(writable, { db, lock, chat, userMessage, target, body, t
     if (!webOn) return (await streamRound(body)).final;
     // Page and search requests share the reply's request budget, always leaving enough for the answer.
     const budgetLeft = () => requestBudget.used < requestBudget.limit - WEB_ROUND_RESERVE;
+    // A notebook that offers its web route makes the requests from its own network.
+    const registered = await readTarget(db).catch(() => null);
     const toolOptions = {
+      ...(registered?.web_key && registered.target === target ? { fetchImpl: notebookFetch(target, registered.web_key) } : {}),
       searchBase: env.WEB_SEARCH_BASE || null,
       pageRewrite: env.WEB_PAGE_REWRITE || null,
       selfOrigin,

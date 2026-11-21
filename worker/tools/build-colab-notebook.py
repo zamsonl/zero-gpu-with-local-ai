@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
-PARTS = ("notebook-log.py", "kaggle-cache.py", "kaggle-stream-proxy.py", "kaggle-jobs.py", "kaggle-server.py")
+PARTS = ("notebook-log.py", "kaggle-cache.py", "kaggle-stream-proxy.py", "kaggle-jobs.py", "kaggle-web.py", "kaggle-server.py")
 
 
 def deployment_origin():

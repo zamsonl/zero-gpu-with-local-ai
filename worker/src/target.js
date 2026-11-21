@@ -23,7 +23,7 @@ export async function readTarget(db) {
   return row ? JSON.parse(row.v) : null;
 }
 
-export async function writeTarget(db, { target, host, num_ctx, vision, quant, control, num_batch, profile_id, inference_transport, job_max_leg_seconds, job_control, model_size, thinking }) {
+export async function writeTarget(db, { target, host, num_ctx, vision, quant, control, num_batch, profile_id, inference_transport, job_max_leg_seconds, job_control, model_size, thinking, web_key }) {
   const value = {
     target,
     at: nowIso(),
@@ -39,6 +39,8 @@ export async function writeTarget(db, { target, host, num_ctx, vision, quant, co
     ...(validJobLegSeconds(job_max_leg_seconds) ? { job_max_leg_seconds } : {}),
     ...(job_control === true ? { job_control: true } : {}),
     ...(typeof thinking === "boolean" ? { thinking } : {}),
+    // The notebook's key for its web route (kaggle-web.py). Never sent to a browser.
+    ...(validWebKey(web_key) ? { web_key } : {}),
   };
   await db
     .prepare(
@@ -71,4 +73,9 @@ export function serverInfo(env, registered) {
     profileId: validProfileId(registered?.profile_id) ? registered.profile_id : null,
     inferenceTransport: validInferenceTransport(registered?.inference_transport) ? registered.inference_transport : null,
   };
+}
+
+/** A notebook's per-run key for its /_web/fetch route: 43-128 URL-safe characters. */
+export function validWebKey(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{43,128}$/.test(value);
 }

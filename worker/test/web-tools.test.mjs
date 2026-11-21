@@ -10,6 +10,8 @@ import {
   WebBudgetError,
   WebToolError,
   decodeEntities,
+  notebookFetch,
+  parseDuckDuckGo,
   queryTerms,
   relevantResults,
   openPage,
@@ -62,7 +64,7 @@ test("Wikipedia results: article links, highlighting stripped, entities decoded"
   assert.throws(() => parseWikipedia({ error: "x" }), WebToolError);
 });
 
-test("search falls back to Wikipedia when Bing fails or finds nothing, and counts every request", async () => {
+test("search falls back to Bing, then Wikipedia, when DuckDuckGo and Bing fail or find nothing, and counts every request", async () => {
   for (const bing of [new Response("busy", { status: 503 }), new Response("<rss><channel></channel></rss>", { headers: { "content-type": "text/xml" } }), new TypeError("network")]) {
     const seen = [];
     let spent = 0;
@@ -72,11 +74,15 @@ test("search falls back to Wikipedia when Bing fails or finds nothing, and count
     });
     assert.equal(found.source, "wikipedia");
     assert.deepEqual(found.results, [{ title: "Kaggle", url: "https://en.wikipedia.org/wiki/Kaggle", snippet: "data science" }]);
-    // Bing as is, Bing with the market fixed, then Wikipedia.
-    assert.equal(seen.length, 3);
-    assert.equal(spent, 3);
-    assert.equal(seen[1].url, "https://www.bing.com/search?format=rss&q=Kaggle%20GPU%20quota&setlang=en-US&cc=US&mkt=en-US");
-    assert(seen[2].url.startsWith("https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=5&srsearch=Kaggle%20GPU%20quota"));
+    // DuckDuckGo (its page, its lite page, both again), Bing as is, Bing with the market fixed, then Wikipedia.
+    assert.equal(seen.length, 7);
+    assert.equal(spent, 7);
+    assert.deepEqual(seen.slice(0, 4).map(({ url }) => url), ["https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/", "https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/"]);
+    assert.equal(seen[0].init.method, "POST");
+    assert.equal(seen[0].init.body, "q=Kaggle%20GPU%20quota&b=&kl=wt-wt");
+    assert.equal(seen[0].init.headers["content-type"], "application/x-www-form-urlencoded");
+    assert.equal(seen[5].url, "https://www.bing.com/search?format=rss&q=Kaggle%20GPU%20quota&setlang=en-US&cc=US&mkt=en-US");
+    assert(seen[6].url.startsWith("https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=5&srsearch=Kaggle%20GPU%20quota"));
     for (const { init } of seen) {
       assert.match(init.headers["user-agent"], /^Mozilla\/5\.0 .*Chrome\//);
       assert(!Object.keys(init.headers).some((name) => /cookie|authorization/i.test(name)), "No cookies or keys are ever sent");
@@ -89,13 +95,13 @@ test("search falls back to Wikipedia when Bing fails or finds nothing, and count
   const asked = [];
   const junk = `<rss><channel><item><title>WhatsApp Web</title><link>https://web.whatsapp.com/</link><description>Log in to WhatsApp Web.</description></item></channel></rss>`;
   const retried = await webSearch("qwen3 model release", { fetchImpl: fakeFetch((url) => new Response(url.includes("mkt=en-US") ? BING_FIXTURE.replace("Rust 1.91 is out", "Qwen3 model release") : junk, { headers: { "content-type": "text/xml" } }), asked) });
-  assert.equal(asked.length, 2);
+  assert.equal(asked.filter(({ url }) => url.includes("bing.com")).length, 2);
   assert.equal(retried.source, "bing");
   assert.equal(retried.results[0].title, "Qwen3 model release & ready");
   // WEB_SEARCH_BASE replaces both origins (tests only).
   const seen = [];
   await webSearch("x", { base: "http://127.0.0.1:9/__web", fetchImpl: fakeFetch(() => new Response("", { status: 500 }), seen) }).catch(() => {});
-  assert.deepEqual(seen.map(({ url }) => url.split("?")[0]), ["http://127.0.0.1:9/__web/search", "http://127.0.0.1:9/__web/search", "http://127.0.0.1:9/__web/w/api.php"]);
+  assert.deepEqual(seen.map(({ url }) => url.split("?")[0]), ["http://127.0.0.1:9/__web/html/", "http://127.0.0.1:9/__web/lite/", "http://127.0.0.1:9/__web/html/", "http://127.0.0.1:9/__web/lite/", "http://127.0.0.1:9/__web/search", "http://127.0.0.1:9/__web/search", "http://127.0.0.1:9/__web/w/api.php"]);
 });
 
 test("search: both backends failing is a tool error; a spent budget and Stop are not swallowed", async () => {
@@ -218,7 +224,7 @@ test("continuation notes: sources and short extracts, capped; nothing when nothi
   assert(many.length < 6_100, "The notes are capped");
 });
 
-test("relevance: query terms skip short words and stopwords; a third of them must appear", () => {
+test("relevance: query terms skip short words and stopwords; half of them must appear", () => {
   assert.deepEqual(queryTerms("What is the Kaggle GPU quota per week in 2026? Qwen3 / 27B"), ["kaggle", "gpu", "quota", "week", "2026", "qwen3", "27b"]);
   const results = [
     { title: "Kaggle GPU quota explained", url: "https://a.example/", snippet: "" },
@@ -234,4 +240,68 @@ test("small helpers: entities and trimmed reasoning", () => {
   assert.equal(trimmedThinking("short"), "short");
   const long = trimmedThinking("a".repeat(600) + "b".repeat(5_000) + "c".repeat(600));
   assert.equal(long, "a".repeat(600) + " [middle of this reasoning trimmed] " + "c".repeat(600));
+});
+
+test("DuckDuckGo results: both page layouts, redirects unwrapped, ads, scripts and its own pages dropped", () => {
+  const html = `<div class="result results_links results_links_deep result--ad "><h2><a rel="nofollow" class="result__a" href="https://duckduckgo.com/y.js?ad_domain=shop.example&amp;u3=1">Ad</a></h2><a class="result__snippet" href="#">Buy</a></div>
+<div class="result results_links results_links_deep web-result "><h2 class="result__title"><a rel="nofollow" class="result__a" href="https://www.accuweather.com/en/my/kuala-lumpur/233776/weather-tomorrow/233776">Weather Tomorrow for Kuala Lumpur &amp; more</a></h2><a class="result__snippet" href="x"><b>Kuala</b> <b>Lumpur</b> forecast &#x27;tomorrow&#x27;</a></div>
+<div class="result results_links results_links_deep web-result "><h2><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.meteoblue.com%2Fen%2Fweather%2Ftoday%2Fkuala-lumpur&amp;rut=1">meteoblue</a></h2></div>
+<div class="result web-result"><a class="result__a" href="javascript:alert(1)">Script</a></div>
+<div class="result web-result"><a class="result__a" href="/settings">Own page</a></div>
+<div class="result web-result"><a class="result__a" href="https://www.accuweather.com/en/my/kuala-lumpur/233776/weather-tomorrow/233776">Duplicate</a></div>`;
+  assert.deepEqual(parseDuckDuckGo(html), [
+    { title: "Weather Tomorrow for Kuala Lumpur & more", url: "https://www.accuweather.com/en/my/kuala-lumpur/233776/weather-tomorrow/233776", snippet: "Kuala Lumpur forecast 'tomorrow'" },
+    { title: "meteoblue", url: "https://www.meteoblue.com/en/weather/today/kuala-lumpur", snippet: "" },
+  ]);
+  const lite = `<table><tr class="result-sponsored"><td><a rel="nofollow" href="https://duckduckgo.com/y.js?ad_domain=x" class='result-link'>Ad</a></td></tr>
+<tr><td><a rel="nofollow" href="https://ollama.com/blog/tool-support" class='result-link'>Tool support · Ollama Blog</a></td></tr><tr><td class='result-snippet'>Ollama now supports <b>tool calling</b>.</td></tr></table>`;
+  assert.deepEqual(parseDuckDuckGo(lite), [{ title: "Tool support · Ollama Blog", url: "https://ollama.com/blog/tool-support", snippet: "Ollama now supports tool calling ." }]);
+  // Its bot check has no results, so the search moves on.
+  assert.deepEqual(parseDuckDuckGo("<html>Unfortunately, bots use DuckDuckGo too.</html>"), []);
+  assert.equal(parseDuckDuckGo(Array.from({ length: 12 }, (_, i) => `<a class="result__a" href="https://e.example/${i}">R${i}</a>`).join("")).length, 8);
+});
+
+test("Bing relevance: half the words, and every letters-and-digits name, must appear", () => {
+  const shakira = [{ title: "Shakira Tickets, 2026-2027 Concert Tour Dates", url: "https://www.ticketmaster.com/shakira", snippet: "Tour dates and release of new album" }];
+  assert.deepEqual(relevantResults(shakira, "qwen3 release date"), [], "A model name with a digit must be in the result");
+  const seattle = [{ title: "10-Day Weather Forecast for Seattle, Washington", url: "https://weather.com/weather/tenday/l/Seattle+WA", snippet: "Be prepared with the most accurate 10-day forecast for Seattle." }];
+  assert.deepEqual(relevantResults(seattle, "weather Kuala Lumpur tomorrow"), [], "Half the words, not a third");
+  const good = [{ title: "Qwen3: release date and model sizes", url: "https://qwen.example/blog", snippet: "" }];
+  assert.deepEqual(relevantResults(good, "qwen3 release date"), good);
+});
+
+test("notebook fetch: the site's answer as a fetch Response; refusals are errors; no route falls back to direct", async () => {
+  const sent = [];
+  const notebook = (answer) => async (url, init) => {
+    sent.push({ url, init });
+    return typeof answer === "function" ? answer(url, init) : answer;
+  };
+  const moved = () => new Response("", { status: 200, headers: { "x-web-status": "301", "x-web-location": "https://example.org/new", "x-web-content-type": "text/html" } });
+  const fetchVia = notebookFetch("https://abc.trycloudflare.com/", "k".repeat(43), notebook(moved));
+  const response = await fetchVia("https://example.org/old", { method: "GET", redirect: "manual", headers: { accept: "text/html" } });
+  assert.equal(response.status, 301);
+  assert.equal(response.headers.get("location"), "https://example.org/new");
+  assert.equal(sent[0].url, "https://abc.trycloudflare.com/_web/fetch");
+  assert.equal(sent[0].init.headers.authorization, "Bearer " + "k".repeat(43));
+  assert.deepEqual(JSON.parse(sent[0].init.body), { url: "https://example.org/old", method: "GET", form: null, accept: "text/html", follow: false });
+  // A search form POST is carried as is; the site's body comes back unchanged.
+  const page = notebookFetch("https://abc.trycloudflare.com", "k".repeat(43), notebook(() => new Response("<p>results</p>", { headers: { "x-web-status": "200", "x-web-content-type": "text/html; charset=utf-8" } })));
+  const searched = await page("https://html.duckduckgo.com/html/", { method: "POST", redirect: "follow", body: "q=x&b=&kl=wt-wt", headers: { accept: "text/html" } });
+  assert.equal(await searched.text(), "<p>results</p>");
+  assert.equal(searched.headers.get("content-type"), "text/html; charset=utf-8");
+  assert.deepEqual(JSON.parse(sent.at(-1).init.body), { url: "https://html.duckduckgo.com/html/", method: "POST", form: "q=x&b=&kl=wt-wt", accept: "text/html", follow: true });
+  // The notebook refusing a private address is the tool's error.
+  const refused = notebookFetch("https://abc.trycloudflare.com", "k".repeat(43), notebook(() => Response.json({ error: "it is not a public web address" }, { status: 403 })));
+  await assert.rejects(refused("https://intranet.example/", { headers: {} }), (error) => error instanceof WebToolError && error.message === "it is not a public web address");
+  // An older notebook without the route, or one that is gone, falls back to Cloudflare's own fetch.
+  for (const missing of [new Response("not found", { status: 404 }), new TypeError("network")]) {
+    const direct = [];
+    const fallback = notebookFetch("https://abc.trycloudflare.com", "k".repeat(43), async (url, init) => {
+      direct.push(url);
+      if (url.endsWith("/_web/fetch")) { if (missing instanceof Error) throw missing; return missing; }
+      return new Response("direct");
+    });
+    assert.equal(await (await fallback("https://example.org/", { headers: {} })).text(), "direct");
+    assert.deepEqual(direct, ["https://abc.trycloudflare.com/_web/fetch", "https://example.org/"]);
+  }
 });

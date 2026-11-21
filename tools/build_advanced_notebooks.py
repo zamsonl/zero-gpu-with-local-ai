@@ -8,7 +8,7 @@ DEST=Path(__file__).resolve().parents[1]
 subprocess.run([sys.executable,str(DEST/'worker/tools/build-colab-notebook.py'),'--public'],check=True)
 (DEST/'notebooks/advanced').mkdir(exist_ok=True)
 shutil.copyfile(DEST/'worker/public/notebooks/heretic-qwen-colab.ipynb',DEST/'notebooks/advanced/colab.ipynb')
-parts=('notebook-log.py','kaggle-cache.py','kaggle-stream-proxy.py','kaggle-jobs.py','kaggle-server.py')
+parts=('notebook-log.py','kaggle-cache.py','kaggle-stream-proxy.py','kaggle-jobs.py','kaggle-web.py','kaggle-server.py')
 runtime='\n\n'.join((DEST/'worker/src'/name).read_text(encoding='utf-8') for name in parts)
 for marker,value in {'__RELAY__':repr(''),'__LAUNCH_TOKEN__':repr(''),'__QUANT__':repr('Q5_K_P'),'__CONTEXTS__':'[98304]','__VISION__':'None','__CACHE_ID__':repr(''),'__BATCH_SIZE__':'256','__PROFILE_ID__':repr('')}.items():runtime=runtime.replace(marker,value)
 compile(runtime,'manual-kaggle-runtime','exec')

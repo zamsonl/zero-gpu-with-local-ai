@@ -36,6 +36,9 @@ import zlib
 
 RELAY = __RELAY__
 LAUNCH_TOKEN = __LAUNCH_TOKEN__
+# The Worker's key for this run's web route (kaggle-web.py), sent only in /_relay/register.
+WEB_KEY = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+WEB_ROUTES = False
 QUANT = __QUANT__
 CACHE_ID = __CACHE_ID__
 BATCH_SIZE = __BATCH_SIZE__
@@ -935,7 +938,7 @@ def serve(context, vision, quant, url):
 
     def register(target):
         global CURRENT_TARGET
-        relay("POST", "/_relay/register", {"target": target, "host": RUNTIME_HOST, "num_ctx": context, "num_batch": BATCH_SIZE, **({"profile_id": PROFILE_ID} if PROFILE_ID else {}), "job_max_leg_seconds": 300, **({"job_control": True} if AGENT_ONLY else {}), "inference_transport": "jobs-v1", "vision": vision, "quant": quant, "control": True, "mode": mode})
+        relay("POST", "/_relay/register", {"target": target, "host": RUNTIME_HOST, "num_ctx": context, "num_batch": BATCH_SIZE, **({"profile_id": PROFILE_ID} if PROFILE_ID else {}), "job_max_leg_seconds": 300, **({"job_control": True} if AGENT_ONLY else {}), "inference_transport": "jobs-v1", "vision": vision, "quant": quant, "control": True, "mode": mode, **({"web_key": WEB_KEY} if WEB_ROUTES else {})})
         CURRENT_TARGET = target
         log(f"READY at {target}: {context // 1024}K context, pictures {'on' if vision else 'off'}, {quant}")
 
@@ -1108,7 +1111,7 @@ def main():
     the tunnel with the model's load. Then serves.
     """
     global OPLOG
-    OPLOG = NotebookLogReporter(RELAY, RUNTIME_HOST, headers={RELAY_HEADER: LAUNCH_TOKEN}, secrets=(LAUNCH_TOKEN,))
+    OPLOG = NotebookLogReporter(RELAY, RUNTIME_HOST, headers={RELAY_HEADER: LAUNCH_TOKEN}, secrets=(LAUNCH_TOKEN, WEB_KEY))
     started = time.time()
     log("Heretic Qwen server starting on " + ("Colab" if RUNTIME_HOST == "colab" else "Kaggle"))
     if AGENT_ONLY:
@@ -1164,10 +1167,15 @@ def main():
     # Job envelopes add a small identity/path wrapper around the original 4 MiB payload.
     proxy = start_stream_proxy(OLLAMA, port=11435, max_request_bytes=4 * 1024 * 1024 + 1024)
     try:
-        global PERSONAL_JOBS, OWNER_JOBS
+        global PERSONAL_JOBS, OWNER_JOBS, WEB_ROUTES
         PERSONAL_JOBS = install_async_job_routes(proxy, max_job_seconds=7200, max_stream_seconds=300, control_token=LAUNCH_TOKEN) if AGENT_ONLY else None
         if not AGENT_ONLY:
             OWNER_JOBS = install_async_job_routes(proxy, max_job_seconds=7200, max_stream_seconds=300)
+            # Web search and page reads for the chat run from this notebook's network: search
+            # engines and many sites refuse Cloudflare Workers (kaggle-web.py).
+            if "install_web_routes" in globals():
+                install_web_routes(proxy, WEB_KEY)
+                WEB_ROUTES = True
         tunnel = Background(start_tunnel)
         report("loading", "Loading the model onto the GPUs")
         context = load_best()

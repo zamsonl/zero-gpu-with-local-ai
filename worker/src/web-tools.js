@@ -1,8 +1,10 @@
 // Web search and page reading for chat replies. The model asks for them as native Ollama tools
 // (web_search, open_page); the Worker runs them and hands the results back framed as untrusted data.
 //
-// Search uses Bing's RSS feed, with Wikipedia's search API as the fallback (both key-free and not
-// blocked from Cloudflare's network). Pages are fetched without cookies or credentials: http(s) on
+// Search uses DuckDuckGo's HTML results page (asked by POST), then its lite page, then Bing's RSS
+// feed, then Wikipedia's search API: all key-free and answering Cloudflare's network (probed
+// 2026-11-21 from SIN; Google, Brave, Mojeek, Qwant, Startpage, Ecosia and SearXNG refused it, and
+// Bing's feed often ignored the query's place or topic). Pages are fetched without cookies or credentials: http(s) on
 // the standard ports only, never the relay itself or an IP-literal/local host, at most 3 redirects
 // (each one checked again), 10 s and 2 MB, text/html or text/plain only, and turned into readable
 // text with HTMLRewriter. Every outside request first calls the caller's `spend`, which counts it
@@ -30,6 +32,8 @@ const URL_CHARS = 2_048;
 const SNIPPET_CHARS = 300;
 const TITLE_CHARS = 300;
 const EXCERPT_CHARS = 1_000; // what a read page keeps on the saved reply, for continuing it later
+const DUCKDUCKGO = "https://html.duckduckgo.com";
+const DUCKDUCKGO_LITE = "https://lite.duckduckgo.com";
 const BING = "https://www.bing.com";
 const WIKIPEDIA = "https://en.wikipedia.org";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -105,21 +109,36 @@ export function webStatus(phase, detail) {
 // ---------------------------------------------------------------- search
 
 /**
- * Up to 8 results `{title, url, snippet}` for `query`: Bing's RSS feed, or Wikipedia's search when
- * Bing fails or finds nothing. Throws WebToolError when both fail.
+ * Up to 8 results `{title, url, snippet}` for `query`: the first of DuckDuckGo (HTML page, then
+ * lite page), Bing's RSS feed and Wikipedia's search that finds something. Throws WebToolError
+ * when all of them fail.
  */
 export async function webSearch(query, { base = null, fetchImpl = fetch, signal = null, spend = () => {}, timeoutMs = SEARCH_TIMEOUT_MS } = {}) {
   const options = { fetchImpl, signal, spend, timeoutMs };
+  const q = encodeURIComponent(query);
+  const html = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8";
   let failure = null;
-  // Bing's feed now and then answers a query with an unrelated list (WhatsApp or forum pages for a
-  // model name, probed on 2026-11-21), with or without a fixed market. Results that share too
-  // little with the query are dropped, and an unrelated list is asked again once with the market
-  // fixed to en-US before Wikipedia is tried.
-  for (const market of ["", "&setlang=en-US&cc=US&mkt=en-US"]) {
+  // DuckDuckGo answers its GET pages from Cloudflare with a bot check, but a POST like its own form
+  // sends gets real results; its ads and own links are dropped. A bot check or an empty page just
+  // moves on. Bing's feed now and then answers with an unrelated list (WhatsApp pages for a model
+  // name, Seattle's weather for Kuala Lumpur's), so its results must share enough of the query's
+  // words, and an unrelated list is asked again once with the market fixed to en-US.
+  // Cloudflare sends each request from a different address and DuckDuckGo checks some of them
+  // (probed: about half got its bot check), so both pages are asked twice before moving on.
+  const duckDuckGo = [
+    () => fetchText(`${base ?? DUCKDUCKGO}/html/`, { ...options, form: `q=${q}&b=&kl=wt-wt`, accept: html }),
+    () => fetchText(`${base ?? DUCKDUCKGO_LITE}/lite/`, { ...options, form: `q=${q}&kl=wt-wt`, accept: html }),
+  ];
+  const sources = [
+    ...[...duckDuckGo, ...duckDuckGo].map((load) => ["duckduckgo", load, parseDuckDuckGo]),
+    ...["", "&setlang=en-US&cc=US&mkt=en-US"].map((market) => ["bing",
+      () => fetchText(`${base ?? BING}/search?format=rss&q=${q}${market}`, { ...options, accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8" }),
+      (xml) => relevantResults(parseBingRss(xml), query)]),
+  ];
+  for (const [source, load, parse] of sources) {
     try {
-      const xml = await fetchText(`${base ?? BING}/search?format=rss&q=${encodeURIComponent(query)}${market}`, { ...options, accept: "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8" });
-      const results = relevantResults(parseBingRss(xml), query);
-      if (results.length) return { query, source: "bing", results };
+      const results = parse(await load());
+      if (results.length) return { query, source, results };
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
       if (error instanceof WebBudgetError) throw error;
@@ -135,6 +154,88 @@ export async function webSearch(query, { base = null, fetchImpl = fetch, signal 
     if (error instanceof WebBudgetError) throw error;
     throw new WebToolError(`the search failed (${(failure ?? error).message})`);
   }
+}
+
+/**
+ * A `fetch` that makes web requests from the notebook's network (its /_web/fetch route,
+ * kaggle-web.py) instead of Cloudflare's, which search engines and many sites refuse. It answers
+ * like `fetch` with the site's own status, content type, Location and body, so every rule here
+ * still applies. The notebook's own refusal (not a public address) is a WebToolError; a notebook
+ * that cannot be reached or has no such route falls back to `direct`.
+ */
+export function notebookFetch(target, key, direct = fetch) {
+  const route = `${String(target).replace(/\/$/, "")}/_web/fetch`;
+  return async (url, init = {}) => {
+    const request = {
+      url: String(url),
+      method: init.method === "POST" ? "POST" : "GET",
+      form: typeof init.body === "string" ? init.body : null,
+      accept: init.headers?.accept ?? "*/*",
+      follow: init.redirect !== "manual",
+    };
+    let response;
+    try {
+      response = await direct(route, { method: "POST", redirect: "manual", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(request), signal: init.signal });
+    } catch (error) {
+      if (init.signal?.aborted) throw error;
+      return direct(url, init);
+    }
+    if (response.status === 403) {
+      const refusal = await response.json().catch(() => ({}));
+      throw new WebToolError(typeof refusal.error === "string" ? clip(refusal.error, 200) : "it is not a public web address");
+    }
+    const status = Number(response.headers.get("x-web-status"));
+    if (response.status !== 200 || !(status >= 200 && status <= 599)) {
+      await response.body?.cancel().catch(() => {});
+      if (init.signal?.aborted) throw init.signal.reason;
+      return direct(url, init);
+    }
+    const headers = new Headers({ "content-type": response.headers.get("x-web-content-type") ?? "" });
+    const location = response.headers.get("x-web-location");
+    if (location) headers.set("location", location);
+    const empty = [204, 205, 304].includes(status);
+    if (empty) await response.body?.cancel().catch(() => {});
+    return new Response(empty ? null : response.body, { status, headers });
+  };
+}
+
+/**
+ * DuckDuckGo's results page. html.duckduckgo.com: `<a class="result__a" href>title</a>` then
+ * `<a class="result__snippet">`; lite.duckduckgo.com: `<a href class='result-link'>` then
+ * `<td class='result-snippet'>`. Its /l/?uddg= redirects are unwrapped; ads (y.js) and its own
+ * pages are dropped.
+ */
+export function parseDuckDuckGo(page) {
+  const text = String(page);
+  const links = [...text.matchAll(/<a\b([^>]*\bclass=["'](?:result__a|result-link)["'][^>]*)>([\s\S]*?)<\/a>/gi)];
+  const results = [];
+  const seen = new Set();
+  for (const [index, link] of links.entries()) {
+    const href = /\bhref=["']([^"']+)["']/i.exec(link[1])?.[1];
+    const url = href ? duckDuckGoTarget(decodeEntities(href)) : null;
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    const block = text.slice(link.index + link[0].length, links[index + 1]?.index ?? text.length);
+    const snippet = /class=["']result(?:__snippet|-snippet)["'][^>]*>([\s\S]*?)<\/(?:a|td)>/i.exec(block)?.[1] ?? "";
+    results.push({
+      title: clip(oneLine(decodeEntities(stripTags(link[2]))), TITLE_CHARS) || new URL(url).hostname,
+      url,
+      snippet: clip(oneLine(decodeEntities(stripTags(snippet))), SNIPPET_CHARS),
+    });
+    if (results.length >= SEARCH_RESULTS) break;
+  }
+  return results;
+}
+
+function duckDuckGoTarget(href) {
+  let url;
+  try {
+    url = new URL(href, "https://duckduckgo.com/");
+  } catch {
+    return null;
+  }
+  if (!/(^|\.)duckduckgo\.com$/i.test(url.hostname)) return httpUrl(url.href);
+  return url.pathname === "/l/" ? httpUrl(url.searchParams.get("uddg") ?? "") : null;
 }
 
 /** Bing's RSS search feed: each `<item>` has a title, link, description and pubDate. */
@@ -164,14 +265,19 @@ export function queryTerms(query) {
   return [...new Set(words)].filter((word) => (word.length >= 3 || /\d/.test(word)) && !STOPWORDS.has(word));
 }
 
-/** The results mentioning enough of the query's terms (a third of them, at least one) in title, snippet or URL. */
+/**
+ * The results mentioning enough of the query's terms in title, snippet or URL: half of them (at
+ * least one), and every name mixing letters and digits ("qwen3", "rtx4090"). A third let tour dates
+ * through for "qwen3 release date".
+ */
 export function relevantResults(results, query) {
   const terms = queryTerms(query);
   if (!terms.length) return results;
-  const need = Math.max(1, Math.ceil(terms.length / 3));
+  const need = Math.max(1, Math.ceil(terms.length / 2));
+  const names = terms.filter((term) => /\p{L}/u.test(term) && /\d/.test(term));
   return results.filter((result) => {
     const text = `${result.title} ${result.snippet} ${result.url}`.toLowerCase();
-    return terms.filter((term) => text.includes(term)).length >= need;
+    return terms.filter((term) => text.includes(term)).length >= need && names.every((name) => text.includes(name));
   });
 }
 
@@ -448,12 +554,15 @@ function rewritten(url, rewrite) {
   return `${rewrite.replace(/\/$/, "")}/${url.hostname}${url.pathname}${url.search}`;
 }
 
-async function fetchText(url, { fetchImpl, signal, spend, timeoutMs, accept }) {
+async function fetchText(url, { fetchImpl, signal, spend, timeoutMs, accept, form = null }) {
   spend();
   const timeout = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
   try {
-    const response = await fetchImpl(url, { method: "GET", redirect: "follow", headers: requestHeaders(accept), signal: combined });
+    const request = form === null
+      ? { method: "GET", redirect: "follow", headers: requestHeaders(accept), signal: combined }
+      : { method: "POST", redirect: "follow", headers: { ...requestHeaders(accept), "content-type": "application/x-www-form-urlencoded" }, body: form, signal: combined };
+    const response = await fetchImpl(url, request);
     if (!response.ok) {
       await response.body?.cancel().catch(() => {});
       throw new WebToolError(`HTTP ${response.status}`);

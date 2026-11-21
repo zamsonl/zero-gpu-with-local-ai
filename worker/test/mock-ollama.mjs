@@ -25,7 +25,8 @@
 //                            the last user message) instead of an answer; later rounds answer, noting
 //                            how many tool results they saw (thinkingTokens only apply to answers)
 //        toolParseErrors     the next N requests that offer tools fail like Ollama's tool-call parser
-//        webSearch           the fake Bing: "results" (default), "empty" or "fail"
+//        webSearch           the fake search engines: "results" (default), "empty" or "fail"
+//        duckDuckGo          the fake DuckDuckGo alone: "results" (default) or "botcheck" (202 + challenge)
 //        webDelayMs          delay before the fake search/page server answers
 //   POST /__mock/fail   {status, count}   the next `count` chat calls answer HTTP `status`
 //   POST /__mock/down | /__mock/up        while down, every /api/* connection is destroyed
@@ -82,6 +83,7 @@ const DEFAULT_BEHAVIOUR = Object.freeze({
   toolRounds: null,
   toolParseErrors: 0,
   webSearch: "results",
+  duckDuckGo: "results",
   webDelayMs: 0,
 });
 
@@ -131,7 +133,7 @@ class MockOllama {
     const { pathname, searchParams } = new URL(req.url, "http://mock");
     try {
       if (pathname.startsWith("/__mock/")) return await this.control(req, res, pathname);
-      if (req.method === "GET" && pathname.startsWith("/__web/")) return await this.web(req, res, pathname, searchParams);
+      if ((req.method === "GET" || req.method === "POST") && pathname.startsWith("/__web/")) return await this.web(req, res, pathname, searchParams);
       if (req.method === "POST" && pathname.startsWith("/v1/")) return await this.kaggleApi(req, res, pathname);
       if (this.down) return req.socket.destroy();
       if (req.method === "GET" && pathname === "/api/version") return sendJson(res, { version: "0.12.6-mock" });
@@ -313,9 +315,35 @@ class MockOllama {
 
   /** The fake web: Bing's RSS search, Wikipedia's search API and a few pages (see the header). */
   async web(req, res, pathname, params) {
-    this.webRequests.push({ path: pathname, query: Object.fromEntries(params), headers: { ...req.headers } });
+    let form = null;
+    if (req.method === "POST") {
+      let raw = "";
+      for await (const part of req) raw += part;
+      form = Object.fromEntries(new URLSearchParams(raw));
+    }
+    this.webRequests.push({ path: pathname, method: req.method, query: Object.fromEntries(params), ...(form ? { form } : {}), headers: { ...req.headers } });
     const b = this.behaviour;
     if (b.webDelayMs > 0) await delay(b.webDelayMs);
+    if (pathname === "/__web/html/" || pathname === "/__web/lite/") {
+      // DuckDuckGo answers a POST of its search form: an ad, two results (one behind its /l/
+      // redirect), a script link and a link to its own pages; or its bot check.
+      if (b.webSearch === "fail") return res.writeHead(503, { "content-type": "text/plain" }).end("busy");
+      if (b.duckDuckGo === "botcheck") return res.writeHead(202, { "content-type": "text/html" }).end("<html><body>Unfortunately, bots use DuckDuckGo too. Please complete the following challenge.</body></html>");
+      const q = form?.q ?? "";
+      const esc = (text) => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll(`"`, "&quot;");
+      const items = b.webSearch === "empty" ? [] : [
+        { ad: true, title: "Sponsored deal", href: "https://duckduckgo.com/y.js?ad_domain=ads.test&amp;u3=x", snippet: "Buy now." },
+        { title: `News about ${esc(q)}`, href: `https://news.test/article?q=${encodeURIComponent(q)}`, snippet: `The latest on <b>${esc(q)}</b> &amp; more.` },
+        { title: "Reference &amp; docs", href: `//duckduckgo.com/l/?uddg=${encodeURIComponent("https://docs.test/reference")}&amp;rut=abc`, snippet: `Reference material on ${esc(q)}.` },
+        { title: "Not a web page", href: "javascript:alert(1)", snippet: "Dropped by the Worker." },
+        { title: "DuckDuckGo settings", href: "/settings", snippet: "Its own page." },
+      ];
+      const lite = pathname === "/__web/lite/";
+      const html = items.map((item) => lite
+        ? `<tr${item.ad ? ` class="result-sponsored"` : ""}><td><a rel="nofollow" href="${item.href}" class='result-link'>${item.title}</a></td></tr><tr><td class='result-snippet'>${item.snippet}</td></tr>`
+        : `<div class="result results_links results_links_deep ${item.ad ? "result--ad" : "web-result"} "><h2 class="result__title"><a rel="nofollow" class="result__a" href="${item.href}">${item.title}</a></h2><a class="result__snippet" href="${item.href}">${item.snippet}</a></div>`).join("\n");
+      return res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(`<html><body>${lite ? "<table>" + html + "</table>" : html}</body></html>`);
+    }
     if (pathname === "/__web/search") {
       if (b.webSearch === "fail") return res.writeHead(503, { "content-type": "text/plain" }).end("busy");
       const q = params.get("q") ?? "";

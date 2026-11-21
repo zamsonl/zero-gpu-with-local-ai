@@ -1,8 +1,10 @@
 """Real Python jobs proxy for Worker route tests; stdin EOF cleans it up."""
 import json
+import os
 import pathlib
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -42,6 +44,36 @@ class FixtureHandler(handler):
 
 
 server.RequestHandlerClass = FixtureHandler
+
+# FIXTURE_WEB_KEY: also the notebook's web route (kaggle-web.py), as the owner's notebook installs
+# it. The fake web is the mock on 127.0.0.1, so requests go there directly; the address rules of the
+# real web_fetch are covered by kaggle-web-test.py.
+web_key = os.environ.get("FIXTURE_WEB_KEY")
+if web_key:
+    exec(compile((root / "src" / "kaggle-web.py").read_text(encoding="utf-8"), "kaggle-web.py", "exec"), namespace)
+    stats["web"] = 0
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    def local_fetch(url, method, form, accept, follow):
+        if urllib.parse.urlsplit(url).hostname != "127.0.0.1":
+            raise namespace["WebRefused"](403, "it is not a public web address")
+        stats["web"] += 1
+        headers = {"Accept": accept, "User-Agent": namespace["_WEB_USER_AGENT"]}
+        if method == "POST":
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        request = urllib.request.Request(url, data=(form or "").encode() if method == "POST" else None, method=method, headers=headers)
+        opener = urllib.request.build_opener() if follow else urllib.request.build_opener(_NoRedirect)
+        try:
+            response = opener.open(request, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        data = response.read()
+        return {"status": response.code, "location": response.headers.get("Location"), "content_type": response.headers.get("Content-Type", "")}, data, False, url
+
+    namespace["install_web_routes"](server, web_key, fetch=local_fetch)
 proxy_url = "http://127.0.0.1:%s" % server.server_address[1]
 closed = threading.Event()
 

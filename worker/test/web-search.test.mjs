@@ -89,7 +89,7 @@ test("a reply searches, reads a page, answers, and saves what it used as Sources
   assert.equal(web.rounds, 3);
   assert.equal(web.searches.length, 1);
   assert.equal(web.searches[0].query, "mock news");
-  assert.equal(web.searches[0].source, "bing");
+  assert.equal(web.searches[0].source, "duckduckgo");
   assert.deepEqual(web.searches[0].results.map((result) => result.url), ["https://news.test/article?q=mock%20news", "https://docs.test/reference"]);
   assert.equal(web.searches[0].results[1].title, "Reference & docs");
   assert.equal(web.pages.length, 1);
@@ -129,8 +129,10 @@ test("a reply searches, reads a page, answers, and saves what it used as Sources
 
   // What the fake web saw: a browser-like agent, no cookies or keys, the page fetched once.
   const requests = stack.mock.webRequests();
-  assert.deepEqual(requests.map((request) => request.path), ["/__web/search", "/__web/page/news.test/article"]);
-  assert.deepEqual(requests[0].query, { format: "rss", q: "mock news" });
+  // DuckDuckGo is asked with a POST of its search form; its ad, script link and own page are dropped.
+  assert.deepEqual(requests.map((request) => request.path), ["/__web/html/", "/__web/page/news.test/article"]);
+  assert.equal(requests[0].method, "POST");
+  assert.deepEqual(requests[0].form, { q: "mock news", b: "", kl: "wt-wt" });
   for (const request of requests) {
     assert.match(request.headers["user-agent"], /^Mozilla\/5\.0 /);
     assert(!request.headers.cookie && !request.headers.authorization && !request.headers["x-relay-key"]);
@@ -304,4 +306,13 @@ test("reasoning recovery after a tool round answers from saved work with the web
   assert(raw.length > 0);
   assert(raw.every((body) => body.tools === undefined));
   assert(raw.some((body) => body.prompt.includes("Web results gathered for this reply") && body.prompt.includes("News about orbit")), "Recovery saw the web results");
+});
+
+test("DuckDuckGo's bot check on every try moves the search on to Bing", async () => {
+  const id = await chat("web-botcheck");
+  stack.mock.configure({ duckDuckGo: "botcheck", toolRounds: [[search("mock news")]] });
+  const done = terminal(await call("POST", `/v1/chats/${id}/turn`, { content: "What is new?", think: false }));
+  assert.equal(done.event, "done", JSON.stringify(done));
+  assert.equal(done.message.stats.web.searches[0].source, "bing");
+  assert.deepEqual(stack.mock.webRequests().map((request) => request.path), ["/__web/html/", "/__web/lite/", "/__web/html/", "/__web/lite/", "/__web/search"]);
 });
