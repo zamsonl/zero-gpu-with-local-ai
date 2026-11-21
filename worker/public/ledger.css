@@ -239,6 +239,11 @@ kbd.shortcut { font: 11px/1.2 var(--ui); border-radius: var(--radius-small); col
 .msg-stats, .live-status, .thinking-meta { font-family: var(--ui); font-variant-numeric: tabular-nums; }
 .msg-stats { color: var(--muted); }
 .msg-foot { gap: 8px; }
+.msg-sources { background: var(--surface); border-color: var(--border); border-radius: var(--radius-surface); }
+.sources-head { color: var(--muted); font-family: var(--ui); }
+.sources-title, .source-title { color: var(--text); }
+.source-host { color: var(--muted); }
+.source-link:hover { background: var(--raised); }
 .msg-action, .code-action { border-radius: var(--radius-small); }
 .msg-continue { border-radius: var(--radius-control); }
 .thinking { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-surface); box-shadow: none; } /* taste-skill-ignore: cancels inherited effects or draws a real overlay/inset edge. */
@@ -273,6 +278,7 @@ kbd.shortcut { font: 11px/1.2 var(--ui); border-radius: var(--radius-small); col
 .composer-bar { padding: 6px 10px 10px; }
 .attach, .think-toggle, .think-toggle[aria-pressed="true"] { background: transparent; color: var(--muted); box-shadow: none; min-height: 32px; border-radius: var(--radius-control); font-size: 12px; } /* taste-skill-ignore: cancels inherited effects or draws a real overlay/inset edge. */
 .attach:hover, .think-toggle:hover, .think-toggle[aria-pressed="true"]:hover { background: var(--raised); color: var(--text); }
+.web-toggle[aria-pressed="false"] { color: var(--faint); }
 .send { background: var(--primary); color: var(--primary-ink); border-radius: var(--radius-control); box-shadow: none; } /* taste-skill-ignore: cancels inherited effects or draws a real overlay/inset edge. */
 .send:hover:not(:disabled) { background: var(--accent-hover); }
 .keys { color: var(--faint); font-family: var(--ui); font-size: 11px; }

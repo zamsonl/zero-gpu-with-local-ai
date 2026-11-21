@@ -10,7 +10,7 @@
 
 import { OfflineError, streamChat, streamTiming } from "./chat-stream.js";
 import { LiveReply } from "./live.js";
-import { isContextOverflow } from "./context.js";
+import { WEB_RESERVE_CHARS, contextMessageCost, isContextOverflow, toolRoomChars } from "./context.js";
 import { UpstreamError } from "./ollama.js";
 import { saveAssistantMessage, updateAssistantMessage, lastMessage } from "./store.js";
 import { readTarget } from "./target.js";
@@ -21,6 +21,7 @@ import {prepareChatPlan,recoverReasoning,thinkingWorkBody,interruptedWorkCode,is
 import {chatRequestBody,continuationPrompt} from './prompt.js';
 import {requireChat} from './chats.js';
 import {phaseStatus,withTransportProgress} from '../public/js/progress-status.js';
+import { MAX_WEB_CALLS, MAX_WEB_ROUNDS, MIN_TOOL_ROOM_CHARS, PAGE_TEXT_CHARS, WEB_ROUND_RESERVE, WEB_TOOLS, WebBudgetError, emptyWebRecord, isToolParseError, readToolCall, runWebTool, trimmedThinking, webNotes, webStatus, withWebGuidance } from "./web-tools.js";
 
 class ClientGone extends Error {}
 class StopRequested extends Error {}
@@ -39,7 +40,11 @@ export function startGeneration(ctx, job) {
   return readable;
 }
 
-async function generate(writable, { db, lock, chat, userMessage, target, body, timingScale, signal = null, continued = null, path, transform, requestContext = null, inferenceTransport = null, env = null, registered = null, preferences = {}, plannedThink = body.think, autoCompact = false, forceRecovery = false, recoveryAnswerOnly = false }) {
+async function generate(writable, { db, lock, chat, userMessage, target, body, timingScale, signal = null, continued = null, path, transform, requestContext = null, inferenceTransport = null, env = null, registered = null, preferences = {}, plannedThink = body.think, autoCompact = false, forceRecovery = false, recoveryAnswerOnly = false, web = false, selfOrigin = null, continuationNotes = "" }) {
+  // Web tools (search, page reading) are offered on fresh chat turns only. A continued reply keeps
+  // what it gathered (`continuationNotes` carries it into the raw prompt).
+  const webOn = Boolean(web && env && path !== "/api/generate");
+  const webRecord = continued?.stats?.web ?? (webOn ? emptyWebRecord() : null);
   const abort = new AbortController();
   const events = new EventWriter(writable, () => abort.abort(new ClientGone()));
   if (signal?.aborted) events.markGone();
@@ -65,7 +70,8 @@ async function generate(writable, { db, lock, chat, userMessage, target, body, t
 
     if(env&&registered&&autoCompact&&!forceRecovery){
       const promptPartial=continued&&plannedThink===false?{...continued,thinking:''}:continued;
-      const plan=await prepareChatPlan({env,chatId:chat.id,registered,think:plannedThink,preferences,partial:promptPartial,signal:abort.signal,onStatus:status=>{live.update(status);return events.send(status);},requestBudget});
+      const plan=await prepareChatPlan({env,chatId:chat.id,registered,think:plannedThink,preferences,partial:promptPartial,signal:abort.signal,onStatus:status=>{live.update(status);return events.send(status);},requestBudget,
+        toolReserveChars:webOn?WEB_RESERVE_CHARS:0,supplementalMessages:continuationNotes?[{role:'user',content:continuationNotes}]:[]});
       requestContext=plan.context;
       preparedProgress=phaseStatus('generation','preparing',{context:requestContext});
       live.update(preparedProgress);
@@ -77,37 +83,7 @@ async function generate(writable, { db, lock, chat, userMessage, target, body, t
     body=thinkingWorkBody(body,plannedThink);
     let final = null,initialError=null;
     if(!forceRecovery)try{
-    const chunks = streamChat({
-      target,
-      inferenceTransport,
-      requestBudget,
-      reloadTarget: async () => (await readTarget(db))?.target ?? null,
-      body,
-      path,
-      transform,
-      signal: abort.signal,
-      timing: streamTiming(timingScale),
-      onStatus: (status) => {
-        const progress=preparedProgress?withTransportProgress(preparedProgress,status):{event:'status',...status};
-        live.update(progress);
-        return events.send(progress);
-      },
-    });
-    for await (const chunk of chunks) {
-      const { thinking, content } = chunk.message ?? {};
-      if (thinking || content) live.update({ thinking, content });
-      if (thinking) {
-        clock.thought();
-        reply.thinking += thinking;
-        await events.send({ event: "thinking", text: thinking });
-      }
-      if (content) {
-        clock.answered();
-        reply.content += content;
-        await events.send({ event: "content", text: content });
-      }
-      if (chunk.done) final = chunk;
-    }
+      final = await streamRounds();
     }catch(error){initialError=error;}
     const canRecover=env&&registered&&!abort.signal.aborted&&!events.gone&&!stoppedRemotely&&reply.thinking;
     const needsRecovery=forceRecovery||canRecover&&(initialError&&(isContextOverflow(initialError)||isWorkBudgetError(initialError)||!reply.content.trim()&&interruptedWorkCode(initialError))||final?.done&&!reply.content.trim());
@@ -123,6 +99,8 @@ async function generate(writable, { db, lock, chat, userMessage, target, body, t
         live.update({assistantMessageId:archived.message.id});
       }
       const recovered=await recoverReasoning({env,chatId:chat.id,registered,reply,previousRecovery:recovery,continuedId:storedMessageId,answerOnly:recoveryAnswerOnly,think:plannedThink,selectedThink:recoveryAnswerOnly?(continued?.stats?.recovery?.selected_think??continued?.stats?.think??plannedThink):plannedThink,initialPasses:forceRecovery?0:1,interruptions:interruptedWorkCode(initialError)?1:0,pauseForBudget:isWorkBudgetError(initialError),signal:abort.signal,requestBudget,
+        // Recovery is a raw continuation without tools; what the reply gathered goes in as notes.
+        webNotes:continuationNotes||(webRecord?webNotes(webRecord):''),
         onStatus:status=>{live.update(status);return events.send(status);},
         onThinking:async text=>{clock.thought();reply.thinking+=text;live.update({thinking:text});await events.send({event:'thinking',text});},
         onContent:async text=>{clock.answered();reply.content+=text;live.update({content:text});await events.send({event:'content',text});},
@@ -135,7 +113,7 @@ async function generate(writable, { db, lock, chat, userMessage, target, body, t
 
     const saved = await store(reply, {
       status: final.done_reason === "length" ? "length" : "complete",
-      stats: { ...replyStats(final), ...clock.stats(), think: plannedThink, work_window_tokens:plannedThink?body.options?.num_predict:undefined, num_ctx: body.options?.num_ctx, num_batch: body.options?.num_batch ?? 512, context: requestContext, ...(recovery?{recovery}:{}) },
+      stats: { ...replyStats(final), ...clock.stats(), think: plannedThink, work_window_tokens:plannedThink?body.options?.num_predict:undefined, num_ctx: body.options?.num_ctx, num_batch: body.options?.num_batch ?? 512, context: requestContext, ...(recovery?{recovery}:{}), ...webStats() },
     });
     if (saved) {
       await live.finish();
@@ -170,7 +148,131 @@ async function generate(writable, { db, lock, chat, userMessage, target, body, t
     }
   }
 
-  function checkpointStats(){return {...(continued?.stats??{}),...clock.stats(),think:plannedThink,work_window_tokens:plannedThink?body.options?.num_predict:undefined,num_ctx:body.options?.num_ctx,num_batch:body.options?.num_batch??512,context:requestContext,...(recovery?{recovery}:{})};}
+  function checkpointStats(){return {...(continued?.stats??{}),...clock.stats(),think:plannedThink,work_window_tokens:plannedThink?body.options?.num_predict:undefined,num_ctx:body.options?.num_ctx,num_batch:body.options?.num_batch??512,context:requestContext,...(recovery?{recovery}:{}),...webStats()};}
+
+  /** `{web}` when the reply searched or read anything (Sources under the answer), else nothing. */
+  function webStats() {
+    return webRecord && (webRecord.calls || webRecord.searches?.length || webRecord.pages?.length) ? { web: webRecord } : {};
+  }
+
+  /** One model call: streams its reasoning and answer to the client and collects any tool calls. */
+  async function streamRound(roundBody, base = null) {
+    const round = { content: "", thinking: "", calls: [], final: null };
+    const chunks = streamChat({
+      target,
+      inferenceTransport,
+      requestBudget,
+      reloadTarget: async () => (await readTarget(db))?.target ?? null,
+      body: roundBody,
+      path,
+      transform,
+      signal: abort.signal,
+      timing: streamTiming(timingScale),
+      onStatus: (status) => {
+        const from = base ?? preparedProgress;
+        const progress = from ? withTransportProgress(from, status) : { event: "status", ...status };
+        live.update(progress);
+        return events.send(progress);
+      },
+    });
+    for await (const chunk of chunks) {
+      let { thinking, content, tool_calls: calls } = chunk.message ?? {};
+      // A later round starts a new paragraph of the same reply.
+      if (base && thinking && !round.thinking && reply.thinking) thinking = "\n\n" + thinking;
+      if (base && content && !round.content && reply.content) content = "\n\n" + content;
+      if (thinking || content) live.update({ thinking, content });
+      if (thinking) {
+        clock.thought();
+        reply.thinking += thinking;
+        round.thinking += thinking;
+        await events.send({ event: "thinking", text: thinking });
+      }
+      if (content) {
+        clock.answered();
+        reply.content += content;
+        round.content += content;
+        await events.send({ event: "content", text: content });
+      }
+      if (Array.isArray(calls)) for (const call of calls) if (round.calls.length < MAX_WEB_CALLS * 2) round.calls.push(readToolCall(call));
+      if (chunk.done) round.final = chunk;
+    }
+    return round;
+  }
+
+  /**
+   * The reply's model calls; returns the final record. Without web tools that is one call. With
+   * them, a call that ends with tool calls has them run here, and the results go back in a new
+   * call (a new job): at most MAX_WEB_ROUNDS calls and MAX_WEB_CALLS tool calls, within the
+   * request budget and the context room. The last call is not offered tools.
+   */
+  async function streamRounds() {
+    if (!webOn) return (await streamRound(body)).final;
+    // Page and search requests share the reply's request budget, always leaving enough for the answer.
+    const budgetLeft = () => requestBudget.used < requestBudget.limit - WEB_ROUND_RESERVE;
+    const toolOptions = {
+      searchBase: env.WEB_SEARCH_BASE || null,
+      pageRewrite: env.WEB_PAGE_REWRITE || null,
+      selfOrigin,
+      signal: abort.signal,
+      spend: () => {
+        if (!budgetLeft()) throw new WebBudgetError("this reply has used its allowance of outside requests");
+        requestBudget.used++;
+      },
+      onStatus: (status) => {
+        live.update(status);
+        return events.send(status);
+      },
+    };
+    let room = requestContext ? toolRoomChars(requestContext) : 0;
+    let offerTools = true;
+    const canOffer = (round) => offerTools && round < MAX_WEB_ROUNDS && webRecord.calls < MAX_WEB_CALLS && room >= MIN_TOOL_ROOM_CHARS && budgetLeft();
+    // The guidance stays in every call, so the model server can reuse the prompt it already read.
+    let messages = withWebGuidance(body.messages);
+    let base = null;
+    let parseFailures = 0;
+    const totals = { eval_count: 0, eval_duration: 0, total_duration: 0 };
+    for (let round = 1; ; round++) {
+      const offer = canOffer(round);
+      webRecord.rounds = round;
+      let result;
+      try {
+        result = await streamRound({ ...body, messages, ...(offer ? { tools: WEB_TOOLS } : {}) }, base);
+      } catch (error) {
+        // The model server rejects a tool call it cannot parse: ask again once, then without tools.
+        if (!offer || abort.signal.aborted || !isToolParseError(error)) throw error;
+        if (++parseFailures >= 2) offerTools = false;
+        base = webStatus("reviewing", "Asking again after a malformed tool call");
+        continue;
+      }
+      for (const key of Object.keys(totals)) totals[key] += result.final?.[key] ?? 0;
+      if (!offer || !result.calls.length || !result.final) return result.final && round > 1 ? { ...result.final, ...totals } : result.final;
+
+      const assistant = { role: "assistant", content: result.content.trim(), ...(result.thinking.trim() ? { thinking: trimmedThinking(result.thinking.trim()) } : {}), tool_calls: result.calls.map(({ name, args }) => ({ function: { name, arguments: args ?? {} } })) };
+      room -= contextMessageCost(assistant) + (assistant.thinking?.length ?? 0) + JSON.stringify(assistant.tool_calls).length;
+      const answers = [];
+      for (const call of result.calls) {
+        abort.signal.throwIfAborted();
+        let content;
+        if (webRecord.calls >= MAX_WEB_CALLS) content = `${call.name} was not run: this reply reached its limit of ${MAX_WEB_CALLS} web tool calls. Answer with what you have.`;
+        else if (room < MIN_TOOL_ROOM_CHARS) content = `${call.name} was not run: the model's context has no room for more web results. Answer with what you have.`;
+        else {
+          webRecord.calls++;
+          const outcome = await runWebTool(call, { ...toolOptions, maxChars: Math.min(PAGE_TEXT_CHARS + 1_000, room - 200) });
+          if (outcome.search) webRecord.searches.push(outcome.search);
+          if (outcome.page) webRecord.pages.push(outcome.page);
+          content = outcome.message;
+        }
+        const answer = { role: "tool", tool_name: call.name || "unknown", content };
+        room -= contextMessageCost(answer);
+        answers.push(answer);
+      }
+      if (!canOffer(round + 1)) answers.at(-1).content += "\n\n(No more web tools are available for this reply. Answer now with what you have.)";
+      messages = [...messages, assistant, ...answers];
+      base = webStatus("reviewing", "Going through the web results");
+      live.update(base);
+      await events.send(base);
+    }
+  }
 
   async function fail(err) {
     const stopped = events.gone || stoppedRemotely;

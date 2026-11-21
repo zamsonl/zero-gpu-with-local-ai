@@ -5,14 +5,16 @@ import { isPictureAttachment } from "./files.js";
 import { tokensShort } from "./telemetry.js";
 import { NORMAL_PROMPT_CHARS, NORMAL_DOCUMENT_CHARS } from "./long-input-ui.js";
 
-export const contextReady = (status) => ["ready", "idle", "images"].includes(status?.server) && Number.isInteger(status?.num_ctx);
+// A notebook reconnecting its tunnel keeps the context it registered with.
+export const contextReady = (status) => ["ready", "idle", "images", "reconnecting"].includes(status?.server) && Number.isInteger(status?.num_ctx);
 
 /** A request preview contains document text, never picture data. */
-export function previewBody({ draft = "", attachments = [], think }) {
+export function previewBody({ draft = "", attachments = [], think, web = true }) {
   const files = attachments.filter((file) => !file.reading);
   return {
     content: draft,
     think,
+    web,
     attachments: files.filter((file) => !isPictureAttachment(file)).map(({ name, type, text }) => ({ name, type, text })),
     pictures_count: files.filter(isPictureAttachment).length,
   };

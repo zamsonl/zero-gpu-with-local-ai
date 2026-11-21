@@ -62,7 +62,7 @@ export async function validRecovery(saved,source){
 }
 
 /** Called only while the caller holds the generation lock. No original message is replaced. */
-export async function prepareChatPlan({env,chatId,registered,think,preferences,partial=null,supplementalMessages=[],signal,onStatus,requestBudget,automatic=true}){
+export async function prepareChatPlan({env,chatId,registered,think,preferences,partial=null,supplementalMessages=[],signal,onStatus,requestBudget,automatic=true,toolReserveChars=0}){
   let transcript=await listTranscript(env.DB,chatId);
   if(partial?.id)transcript=transcript.filter(m=>m.id!==partial.id);
   let checkpoint=validCheckpoint(await readCheckpoint(env.DB,chatId),transcript);
@@ -71,7 +71,7 @@ export async function prepareChatPlan({env,chatId,registered,think,preferences,p
   // must not consume the logical reply reservation or displace the latest task.
   const reservedPartial=supplementalMessages.length?{...partial,thinking:(partial?.thinking??'')+' '.repeat(supplementalMessages.reduce((total,message)=>total+contextMessageCost(message),0))}:partial;
   const makePlan=()=>{
-    const result=planContext({transcript:mappedTranscript(transcript,vision),numCtx,think,preferences,partial:reservedPartial,checkpoint});
+    const result=planContext({transcript:mappedTranscript(transcript,vision),numCtx,think,preferences,partial:reservedPartial,checkpoint,toolReserveChars});
     if(supplementalMessages.length)result.messages.push(...supplementalMessages);
     return result;
   };
@@ -91,7 +91,7 @@ export async function prepareChatPlan({env,chatId,registered,think,preferences,p
   return plan;
 }
 
-export async function recoverReasoning({env,chatId,registered,reply,previousRecovery,signal,onStatus,onThinking,onContent,onCheckpoint,requestBudget,answerOnly=false,continuedId=null,think=true,selectedThink=think,initialPasses=0,interruptions=0,pauseForBudget=false}){
+export async function recoverReasoning({env,chatId,registered,reply,previousRecovery,signal,onStatus,onThinking,onContent,onCheckpoint,requestBudget,answerOnly=false,continuedId=null,think=true,selectedThink=think,initialPasses=0,interruptions=0,pauseForBudget=false,webNotes=''}){
   const {numCtx,numBatch,inferenceTransport}=serverInfo(env,registered);
   let source=reply.thinking;
   const task=(await listTranscript(env.DB,chatId)).findLast(message=>message.role==='user');
@@ -204,7 +204,7 @@ export async function recoverReasoning({env,chatId,registered,reply,previousReco
     const thinking=Boolean(effort)&&!reply.content.trim();
     const logicalPreferences=finishOnly?{...preferences,max_reply_tokens:Math.min(preferences.max_reply_tokens??ANSWER_TOKENS,ANSWER_TOKENS)}:preferences;
     const partial={id:continuedId,content:reply.content,thinking:''};
-    const plan=await prepareChatPlan({env,chatId,registered,think:effort,preferences:logicalPreferences,partial,supplementalMessages:[{role:'user',content:preservedWork+'\nContinue the task from this saved work. Preserve exact user requirements and corrections. Do not restart a long analysis loop; prioritize completing the answer.'}],signal,onStatus,requestBudget});
+    const plan=await prepareChatPlan({env,chatId,registered,think:effort,preferences:logicalPreferences,partial,supplementalMessages:[{role:'user',content:preservedWork+(webNotes?'\n'+webNotes:'')+'\nContinue the task from this saved work. Preserve exact user requirements and corrections. Do not restart a long analysis loop; prioritize completing the answer.'}],signal,onStatus,requestBudget});
     const messages=plan.messages;
     finalContext={...plan.context,auto_reasoning_recovery:true};
     const workProgress=phaseStatus('reasoning_recovery',thinking?'resuming':'finishing',{finish_reason:recovery.finish_reason??null});

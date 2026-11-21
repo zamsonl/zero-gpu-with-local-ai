@@ -2,9 +2,12 @@
 // the chat API and must not change: plain-text errors, and register answers {"ok":true,…}.
 //
 //   POST /_relay/register    { target, host?, num_ctx?, vision?, quant?, control? }
-//   POST /_relay/unregister  { target }               the notebook is shutting down
+//   POST /_relay/unregister  { target, reason?, detail?, uptime_s?, idle_minutes? }   the notebook is
+//                            shutting down, and why (reason: idle, requested, replaced, runtime_limit,
+//                            tunnel_failed, crashed or terminated); older notebooks send only target
 //   POST /_relay/progress    { host, stage, detail?, percent? }   start-up progress for the page
-//   GET  /_relay/command?target=…   → { shutdown, reason, registered, idle_minutes, mode?, job? }  (polled)
+//   GET  /_relay/command?target=…&idle=…&tunnel=…   → { shutdown, reason, registered, idle_minutes, mode?, job? }
+//                            (polled; idle, and tunnel=reconnecting, are the notebook's check-in)
 //   POST /_relay/mode        { target, mode, state, detail?, percent? }   switching chat <-> pictures
 //   POST /_relay/image-progress  { id, step }  → { ok, cancel }
 //   POST /_relay/image-result?id=…&kind=thumb|full|error   a finished picture (see images.js)
@@ -17,13 +20,16 @@ import { settings } from "./config.js";
 import { HttpError, readJsonObject, text } from "./http.js";
 import {
   BOOT_STAGES,
+  STOP_REASONS,
   clearShutdown,
-  closeKaggleSession,
+  clearStop,
   commandFor,
   endBoot,
-  openKaggleSession,
+  readState,
   recordIdle,
+  refreshQuotaSoon,
   writeBoot,
+  writeStop,
 } from "./server-control.js";
 import { HOSTS, clearTarget, readTarget, validBatch, validProfileId, validModelSize, validInferenceTransport, validJobLegSeconds, writeTarget } from "./target.js";
 import { rawBatchDefault } from "./raw-options.js";
@@ -75,7 +81,8 @@ export async function handleRelay(request, env, url, ctx = null) {
       const target = url.searchParams.get("target");
       // The notebook says how long nobody has used it, for the page's idle countdown.
       const idle = Number(url.searchParams.get("idle"));
-      if (target && url.searchParams.has("idle") && Number.isInteger(idle) && idle >= 0) await recordIdle(env.DB, target, idle);
+      const tunnel = url.searchParams.get("tunnel") === "reconnecting" ? "reconnecting" : null;
+      if (target && url.searchParams.has("idle") && Number.isInteger(idle) && idle >= 0) await recordIdle(env.DB, target, idle, tunnel);
       return Response.json(await commandFor(env.DB, env, target));
     }
     case "/_relay/status":
@@ -127,18 +134,41 @@ async function register(request, env, config) {
   } else {
     await resetForNewServer(env.DB);
   }
-  await Promise.all([clearShutdown(env.DB, target), endBoot(env.DB, host ?? "colab")]);
+  // A running server has no "last stop" to explain.
+  await Promise.all([clearShutdown(env.DB, target), endBoot(env.DB, host ?? "colab"), clearStop(env.DB)]);
   if (host === "kaggle") await rememberFit(env.DB, { num_ctx, quant, vision, num_batch, profile_id });
   return Response.json({ ok: true, target });
+}
+
+/** Free text from a notebook, made safe to show: one line, at most MAX_DETAIL_CHARS. */
+function cleanDetail(detail) {
+  return detail?.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_DETAIL_CHARS) || null;
 }
 
 async function unregister(request, env) {
   const fields = await body(request);
   if (!fields || typeof fields.target !== "string") return text("bad target\n", 400);
+  const { reason, detail, uptime_s, idle_minutes } = fields;
+  if (reason != null && !STOP_REASONS.includes(reason)) return text("bad reason\n", 400);
+  if (detail != null && typeof detail !== "string") return text("bad detail\n", 400);
+  if (uptime_s != null && !(Number.isFinite(uptime_s) && uptime_s >= 0 && uptime_s <= 7 * 24 * 3600)) return text("bad uptime_s\n", 400);
+  if (idle_minutes != null && !(Number.isInteger(idle_minutes) && idle_minutes > 0 && idle_minutes <= 24 * 60)) return text("bad idle_minutes\n", 400);
   const current = await readTarget(env.DB);
   const removed = await clearTarget(env.DB, fields.target);
-  if (removed) await endBoot(env.DB, current.host ?? "colab");
-  if (removed && current.host === "kaggle") await closeKaggleSession(env.DB);
+  // The notebook's own failure report (if any) stays on the page until the next start.
+  if (removed) await endBoot(env.DB, current.host ?? "colab", { keepFailed: true });
+  // Why it stopped, for the page: from the server it was showing (or when none was registered),
+  // never from an older one signing off after another took over.
+  if (reason && (removed || !current)) {
+    await writeStop(env.DB, {
+      reason,
+      detail: cleanDetail(detail),
+      uptime_s: uptime_s == null ? null : Math.round(uptime_s),
+      idle_minutes: reason === "idle" ? idle_minutes ?? null : null,
+      host: current?.host ?? null,
+    });
+  }
+  if (removed && current.host === "kaggle") await refreshQuotaSoon(env.DB);
   return Response.json({ ok: true, removed });
 }
 
@@ -152,9 +182,15 @@ async function progress(request, env) {
   if (percent != null && !(Number.isInteger(percent) && percent >= 0 && percent <= 100)) return text("bad percent\n", 400);
   const clean = detail?.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, MAX_DETAIL_CHARS) || null;
   await writeBoot(env.DB, { host, stage, detail: clean, percent: percent ?? null });
-  // A Kaggle run's GPU time starts with its first report and ends if it fails.
-  if (host === "kaggle" && stage === "installing") await openKaggleSession(env.DB);
-  if (host === "kaggle" && stage === "failed") await closeKaggleSession(env.DB);
+  if (stage === "failed") {
+    // A failed start-up is also why the server stopped, unless the notebook signed off with its own
+    // reason moments ago (a crash while serving reports both: the sign-off says more).
+    const stop = await readState(env.DB, "server_stop");
+    if (!(stop && stop.reason !== "start_failed" && Date.now() - Date.parse(stop.at) < 2 * 60_000)) {
+      await writeStop(env.DB, { reason: "start_failed", detail: clean, uptime_s: null, idle_minutes: null, host });
+    }
+    if (host === "kaggle") await refreshQuotaSoon(env.DB);
+  }
   return Response.json({ ok: true });
 }
 

@@ -414,9 +414,12 @@ export class ImagesView {
     let progress = null;
     if (!status || server === "unreachable") {
       text = "Checking the server…";
+    } else if (server === "reconnecting") {
+      tone = "warn";
+      text = "Reconnecting to the notebook. It is still running; pictures continue once its connection is back.";
     } else if (server === "offline" || server === "unregistered") {
       tone = "err";
-      text = "The server is off. Start it with the button at the top right, then make pictures.";
+      text = "The server is off. Start it from Session (top right) → Start, then make pictures.";
     } else if (!status.can_shut_down) {
       tone = "warn";
       text = "Pictures need the updated Kaggle or Colab runtime, which can switch its GPUs between chat and pictures.";

@@ -7,6 +7,7 @@ const STATES = {
   recovering: 'Preserving unfinished work', compacting: 'Summarizing earlier messages',
   reading: 'Reading the saved input', thinking: 'Thinking', answering: 'Writing the answer',
   saving: 'Saving progress', preparing: 'Preparing the next reply',
+  searching: 'Searching the web', reviewing: 'Going through the web results',
 };
 function count(status) {
   return Number.isInteger(status.chunk) && status.chunk > 0 && Number.isInteger(status.chunks) && status.chunks >= status.chunk
@@ -32,6 +33,7 @@ function primary(status) {
     if(phase==='preparing_answer')return 'Preparing the answer from saved notes';
     if(phase==='saving')return 'Saving reading progress';
   }
+  if(operation==='web')return status.detail || STATES[phase] || 'Using the web';
   if(operation==='generation'&&phase==='preparing')return 'Preparing the reply from saved conversation memory';
   if(operation==='generation'&&phase==='saving')return 'Saving reply progress';
   return status.detail || STATES[status.state] || 'Working on the reply';

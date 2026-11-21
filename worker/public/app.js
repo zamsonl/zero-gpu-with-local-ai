@@ -111,7 +111,7 @@ const composer = new Composer({
 contextView = new ContextView({
   status,
   snapshot: () => ({ chatId: state.chat?.id ?? null, draft: composer.value, attachments: composer.attachments,
-    think: composer.think, messages: state.messages, busy: Boolean(state.generation || state.compaction), compacting: Boolean(state.compaction) }),
+    think: composer.think, web: composer.web, messages: state.messages, busy: Boolean(state.generation || state.compaction), compacting: Boolean(state.compaction) }),
   onCompact: () => compactSession(),
   onContext: (context) => { telemetry.setContext(context); composer.setContext(context); longInputView?.render(); sessionRail?.refresh(); },
 });
@@ -498,7 +498,7 @@ async function send(text, { replaceFrom = null, attachments = [], draftSnapshot 
   wakeLock.acquire();
   announce("Sending");
 
-  const body = { content: text, think };
+  const body = { content: text, think, web: composer.web !== false };
   if (attachments.length) body.attachments = attachments;
   if (replaceFrom) body.replace_from = replaceFrom.id;
 
@@ -999,7 +999,8 @@ function describeSendError(err) {
   if (err instanceof ApiError) {
     if (err.code === "busy") return "Another device is generating a reply right now. Send again when it finishes.";
     if (err.code === "image_mode") return "The GPUs are making pictures right now. Switch back to chat (above the message box), then send again.";
-    if (err.code === "offline") return "The model server isn't running. Start it with the Open button at the top right, then send again.";
+    if (err.code === "offline" && status.status?.server === "reconnecting") return "The notebook is still running but reconnecting its tunnel. Send again in a minute or two.";
+    if (err.code === "offline") return "The model server isn't running. Start it from Session (top right) → Start, or from the card above the message box, then send again.";
     return err.message;
   }
   return "Couldn't send the message. Check your connection and try again.";

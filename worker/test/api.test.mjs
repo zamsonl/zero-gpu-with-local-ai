@@ -509,8 +509,9 @@ describe("open stack", () => {
     test("ready when /api/ps lists the model", async () => {
       const res = await call(open, "GET", "/v1/status");
       assert.equal(res.status, 200);
-      const { target_registered_at, ...rest } = res.json;
+      const { target_registered_at, kaggle_quota, ...rest } = res.json;
       assert.ok(!Number.isNaN(Date.parse(target_registered_at)));
+      assert.ok(kaggle_quota === null || kaggle_quota.total_s === 108000, JSON.stringify(kaggle_quota));
       assert.deepEqual(rest, {
         server: "ready",
         model: "qwen3.8-hauhau",
@@ -524,11 +525,11 @@ describe("open stack", () => {
         busy: null,
         boot: null,
         shutting_down: false,
-        gpu_hours_week: 0,
         idle_shutdown_at: null,
         idle_minutes: 45,
         mode: { current: "chat", requested: "chat", state: "ready", detail: null, percent: null },
         images_waiting: 0,
+        last_stop: null,
         colab_url: "https://colab.research.google.com/drive/EXAMPLE_NOTEBOOK_ID",
         kaggle_url: null,
       });
@@ -1111,7 +1112,7 @@ describe("open stack", () => {
     const start = () => call(open, "POST", "/v1/server/start");
     const pushedToken = () => /LAUNCH_TOKEN = "([A-Za-z0-9_-]+)"/.exec(open.mock.kagglePushes().at(-1).text)[1];
     afterEach(async () => {
-      await open.sql("DELETE FROM state WHERE k IN ('launch', 'launches', 'boot', 'kaggle_fit', 'kaggle_sessions', 'server_idle')");
+      await open.sql("DELETE FROM state WHERE k IN ('launch', 'launches', 'boot', 'kaggle_fit', 'server_idle', 'server_stop', 'kaggle_run_check', 'kaggle_quota', 'kaggle_quota_due')");
       open.mock.resetKaggle();
       open.mock.setDown(false);
       await register(open, open.mock.url);
@@ -1254,23 +1255,131 @@ describe("open stack", () => {
       assertApiError(await call(keyed, "GET", "/v1/server/log", { headers: withKey }), 409, "not_configured");
     });
 
-    test("GPU hours this week: a run counts from its first report to its sign-off", async () => {
-      const day = 24 * 3600_000;
-      const iso = (ago) => new Date(Date.now() - ago).toISOString();
-      // Two hours three days ago, and one run from last month that no longer counts.
-      const list = [{ start: iso(3 * day), end: iso(3 * day - 2 * 3600_000) }, { start: iso(30 * day), end: iso(30 * day - 3600_000) }];
-      await open.sql(`INSERT INTO state (k, v, updated_at) VALUES ('kaggle_sessions', '${JSON.stringify({ list })}', '${iso(0)}')`);
-      assert.equal((await call(open, "GET", "/v1/status")).json.gpu_hours_week, 2);
-
-      await call(open, "POST", "/_relay/progress", { body: { host: "kaggle", stage: "installing" }, headers: withKey });
-      await delay(1200);
-      const running = (await call(open, "GET", "/v1/status")).json.gpu_hours_week;
-      assert.ok(running >= 2 && running < 2.1, String(running));
+    test("a notebook that checked in moments ago is reconnecting, not offline, and is never started twice", async () => {
       await registerKaggle(open);
+      const target = encodeURIComponent(open.mock.url);
+      const ago = (ms) => open.sql(`UPDATE state SET v = json_set(v, '$.at', '${new Date(Date.now() - ms).toISOString()}') WHERE k = 'server_idle'`);
+      await call(open, "GET", `/_relay/command?target=${target}&idle=30`, { headers: withKey });
+      open.mock.setDown(true);
+      const status = (await call(open, "GET", "/v1/status")).json;
+      assert.deepEqual([status.server, status.last_stop], ["reconnecting", null]);
+      assertApiError(await start(), 409, "running");
+      assert.equal(open.mock.kagglePushes().length, 0, "no second run that would make Kaggle cancel the live one");
+      // A check-in older than 90 s no longer counts...
+      await ago(120_000);
+      assert.equal((await call(open, "GET", "/v1/status")).json.server, "offline");
+      // ...unless the notebook said it is replacing its tunnel: that counts for 5 minutes.
+      await call(open, "GET", `/_relay/command?target=${target}&idle=30&tunnel=reconnecting`, { headers: withKey });
+      await ago(180_000);
+      assert.equal((await call(open, "GET", "/v1/status")).json.server, "reconnecting");
+      await ago(360_000);
+      assert.equal((await call(open, "GET", "/v1/status")).json.server, "offline");
+      assert.equal((await start()).status, 200, "a notebook that went silent can be started again");
+    });
+
+    test("the notebook's sign-off says why it stopped, until a server registers again", async () => {
+      await registerKaggle(open);
+      const off = (body, target = open.mock.url) => call(open, "POST", "/_relay/unregister", { body: { target, ...body }, headers: withKey });
+      for (const bad of [{ reason: "bored" }, { reason: 7 }, { reason: "idle", detail: 5 }, { reason: "idle", uptime_s: -1 }, { reason: "idle", uptime_s: "1h" }, { reason: "idle", idle_minutes: 1.5 }]) {
+        assert.equal((await off(bad)).status, 400, JSON.stringify(bad));
+      }
+      assert.equal((await call(open, "GET", "/v1/status")).json.server, "ready", "a refused sign-off keeps the server");
+      const detail = `Nobody used it\nfor 45 minutes ${"x".repeat(400)}`;
+      assert.deepEqual((await off({ reason: "idle", detail, uptime_s: 3600.4, idle_minutes: 45 })).json, { ok: true, removed: true });
+      const status = (await call(open, "GET", "/v1/status")).json;
+      assert.equal(status.server, "unregistered");
+      const { at, ...stop } = status.last_stop;
+      assert.ok(Math.abs(Date.now() - Date.parse(at)) < 60_000, at);
+      assert.deepEqual([stop.reason, stop.idle_minutes, stop.uptime_s], ["idle", 45, 3600]);
+      assert.ok(stop.detail.startsWith("Nobody used it for 45 minutes") && stop.detail.length <= 200, stop.detail);
+      const due = JSON.parse((await open.sql("SELECT v FROM state WHERE k = 'kaggle_quota_due'"))[0].v);
+      assert.ok(Date.parse(due.due_at) - Date.now() > 15_000, "Kaggle's quota is read again soon after a stop");
+
+      await registerKaggle(open);
+      assert.equal((await call(open, "GET", "/v1/status")).json.last_stop, null, "a new server has nothing to explain");
+      // An older server signing off after another took over changes nothing.
+      assert.deepEqual((await off({ reason: "crashed", detail: "old" }, "https://older.trycloudflare.com")).json, { ok: true, removed: false });
+      assert.equal((await call(open, "GET", "/v1/status")).json.last_stop, null);
+      // Older notebooks send the target alone.
+      assert.deepEqual((await off({})).json, { ok: true, removed: true });
+      assert.equal((await call(open, "GET", "/v1/status")).json.last_stop, null);
+    });
+
+    test("a failed start-up is why the server stopped, and stays on the page until the next start", async () => {
+      open.mock.setDown(true);
       await call(open, "POST", "/_relay/unregister", { body: { target: open.mock.url }, headers: withKey });
-      const stored = JSON.parse((await open.sql("SELECT v FROM state WHERE k = 'kaggle_sessions'"))[0].v).list;
-      assert.equal(stored.length, 2, "runs older than two weeks are dropped");
-      assert.ok(stored.every((s) => s.end), "the sign-off closed the run");
+      await call(open, "POST", "/_relay/progress", { body: { host: "kaggle", stage: "failed", detail: "Ollama didn't start" }, headers: withKey });
+      const old = new Date(Date.now() - 30 * 60_000).toISOString();
+      await open.sql(`UPDATE state SET v = json_set(v, '$.at', '${old}') WHERE k IN ('boot', 'server_stop')`);
+      const status = (await call(open, "GET", "/v1/status")).json;
+      assert.deepEqual([status.boot?.stage, status.boot?.detail], ["failed", "Ollama didn't start"], "still shown after 30 minutes");
+      assert.deepEqual([status.last_stop?.reason, status.last_stop?.detail], ["start_failed", "Ollama didn't start"]);
+      assert.equal((await start()).status, 200);
+      const started = (await call(open, "GET", "/v1/status")).json;
+      assert.deepEqual([started.boot.stage, started.last_stop], ["queued", null]);
+
+      // A crash while serving: the sign-off's reason wins over the failure report that follows it,
+      // and the failure stays on the page.
+      await open.sql("DELETE FROM state WHERE k IN ('boot', 'launch', 'launches')");
+      await registerKaggle(open);
+      await call(open, "POST", "/_relay/unregister", { body: { target: open.mock.url, reason: "crashed", detail: "RuntimeError: CUDA error" }, headers: withKey });
+      await call(open, "POST", "/_relay/progress", { body: { host: "kaggle", stage: "failed", detail: "RuntimeError: CUDA error" }, headers: withKey });
+      const crashed = (await call(open, "GET", "/v1/status")).json;
+      assert.deepEqual([crashed.last_stop.reason, crashed.last_stop.detail, crashed.boot?.stage], ["crashed", "RuntimeError: CUDA error", "failed"]);
+    });
+
+    test("a Kaggle server that went silent: Kaggle is asked about its run at most once a minute", async () => {
+      open.mock.setDown(true);
+      assert.equal((await start()).status, 200);
+      await registerKaggle(open); // its notebook connected, then went silent without signing off
+      open.mock.setKaggleStatus("CANCEL_ACKNOWLEDGED");
+      const before = open.mock.kaggleStatusCalls();
+      const first = (await call(open, "GET", "/v1/status")).json;
+      assert.equal(first.server, "offline");
+      assert.deepEqual([first.last_stop?.reason, first.last_stop?.status], ["kaggle_ended", "CANCEL_ACKNOWLEDGED"]);
+      for (let i = 0; i < 3; i++) assert.equal((await call(open, "GET", "/v1/status")).json.last_stop?.reason, "kaggle_ended");
+      assert.equal(open.mock.kaggleStatusCalls() - before, 1, "Kaggle is asked at most once a minute");
+      open.mock.setKaggleStatus("RUNNING");
+      await delay(60_000 * TIMING_SCALE + 300);
+      assert.equal((await call(open, "GET", "/v1/status")).json.last_stop, null, "a run Kaggle still runs isn't called ended");
+      assert.equal(open.mock.kaggleStatusCalls() - before, 2);
+    });
+
+    test("Kaggle GPU quota: Kaggle's own count, kept a few minutes, the last good answer kept when Kaggle fails", async () => {
+      open.mock.setKaggleQuota({ used: 80031.2, reserved: 0, total: 108000, refresh: "2026-11-28T00:00:00Z", fail: 0 });
+      const calls = open.mock.kaggleQuotaCalls();
+      const quota = (await call(open, "GET", "/v1/status")).json.kaggle_quota;
+      const { fetched_at, ...rest } = quota;
+      assert.deepEqual(rest, { used_s: 80031, total_s: 108000, reserved_s: 0, remaining_s: 27968, refreshes_at: "2026-11-28T00:00:00.000Z" });
+      assert.ok(Math.abs(Date.now() - Date.parse(fetched_at)) < 60_000);
+      assert.deepEqual((await call(open, "GET", "/v1/status")).json.kaggle_quota, quota, "kept, not asked again");
+      assert.equal(open.mock.kaggleQuotaCalls() - calls, 1);
+      assert.equal((await call(keyed, "GET", "/v1/status", { headers: withKey })).json.kaggle_quota, null, "no Kaggle set up: no meter");
+
+      const expire = () => open.sql("UPDATE state SET v = json_set(v, '$.tried_at', '2000-01-01T00:00:00.000Z') WHERE k = 'kaggle_quota'");
+      open.mock.setKaggleQuota({ fail: 503, used: 90000 });
+      await expire();
+      assert.deepEqual((await call(open, "GET", "/v1/status")).json.kaggle_quota, quota, "answered at once from the kept value");
+      await delay(500);
+      assert.deepEqual((await call(open, "GET", "/v1/status")).json.kaggle_quota, quota, "Kaggle failed: the last good answer stays");
+      assert.equal(open.mock.kaggleQuotaCalls() - calls, 2, "and Kaggle isn't asked on every poll");
+
+      open.mock.setKaggleQuota({ fail: 0, reserved: 1800 });
+      await expire();
+      await call(open, "GET", "/v1/status");
+      await delay(500);
+      const fresh = (await call(open, "GET", "/v1/status")).json.kaggle_quota;
+      assert.deepEqual([fresh.used_s, fresh.reserved_s, fresh.remaining_s], [90000, 1800, 16200]);
+
+      // A start or a stop asks for a fresh count soon after, before the few minutes are up.
+      const due = new Date().toISOString(); // due now: after the count read above
+      await open.sql(`INSERT INTO state (k, v, updated_at) VALUES ('kaggle_quota_due', '{"due_at":"${due}"}', '${due}') ON CONFLICT (k) DO UPDATE SET v = excluded.v`);
+      await delay(100);
+      const beforeDue = open.mock.kaggleQuotaCalls();
+      await call(open, "GET", "/v1/status");
+      await delay(300);
+      await call(open, "GET", "/v1/status");
+      assert.equal(open.mock.kaggleQuotaCalls() - beforeDue, 1, "the due refresh happens once");
     });
 
     test("the idle countdown follows the notebook's own report", async () => {
@@ -1472,7 +1581,9 @@ describe("open stack", () => {
       await turn(open, chat.id, { content: pad("old", 4500), think: false });
       await turn(open, chat.id, { content: "now", think: true });
       const sent = open.mock.lastChat();
-      assert.deepEqual(sent.messages[0], { role: "system", content: "Answer like a pirate." });
+      // Web tools are on by default: their guidance joins the custom instructions in one system message.
+      assert.equal(sent.messages[0].role, "system");
+      assert.match(sent.messages[0].content, /^Answer like a pirate\.\n\nToday's date is \d{4}-\d{2}-\d{2}\. You can search the web/);
       assert.equal(sent.messages.filter((m) => m.role === "system").length, 1);
       assert.deepEqual(sent.options, { ...THINK_OPTIONS, temperature: 0.3, num_predict: 1000 });
       // 4000 chars of history: the 4500-char first message no longer fits.
@@ -1485,7 +1596,7 @@ describe("open stack", () => {
     test("happy path: events, persistence, stats and the exact Ollama request", async () => {
       const chat = await createChat(open);
       const content = "   Hello\n\nthere,   model. Please explain recursion in one line.   ";
-      const res = await turn(open, chat.id, { content, think: true });
+      const res = await turn(open, chat.id, { content, think: true, web: false });
       assert.equal(res.status, 200);
       assert.equal(res.headers.get("content-type"), "application/x-ndjson; charset=utf-8");
       assert.equal(res.headers.get("cache-control"), "no-store, no-transform");
@@ -1568,10 +1679,10 @@ describe("open stack", () => {
 
     test("context: earlier turns are sent without thinking", async () => {
       const chat = await createChat(open);
-      const first = await turn(open, chat.id, { content: "first", think: true });
+      const first = await turn(open, chat.id, { content: "first", think: true, web: false });
       const firstReply = first.events.at(-1).message;
       assert.ok(firstReply.thinking);
-      await turn(open, chat.id, { content: "second", think: true });
+      await turn(open, chat.id, { content: "second", think: true, web: false });
       assert.deepEqual(open.mock.lastChat().messages, [
         { role: "user", content: "first" },
         { role: "assistant", content: firstReply.content },
@@ -1601,7 +1712,7 @@ describe("open stack", () => {
         },
       });
       const original = (await getChat(open, id)).messages;
-      const res = await turn(open, id, { content: "final", think: false });
+      const res = await turn(open, id, { content: "final", think: false, web: false });
       assert.equal(kinds(res.events).at(-1), "done");
       const sent = open.mock.lastChat().messages;
       assert.equal(sent[0].role, "user");
@@ -1629,12 +1740,12 @@ describe("open stack", () => {
 
     test("replace_from regenerates the last reply", async () => {
       const chat = await createChat(open);
-      await turn(open, chat.id, { content: "q1", think: false });
-      await turn(open, chat.id, { content: "q2", think: false });
+      await turn(open, chat.id, { content: "q1", think: false, web: false });
+      await turn(open, chat.id, { content: "q2", think: false, web: false });
       const before = (await getChat(open, chat.id)).messages;
       assert.equal(before.length, 4);
 
-      const res = await turn(open, chat.id, { content: "q2", think: false, replace_from: before[2].id });
+      const res = await turn(open, chat.id, { content: "q2", think: false, web: false, replace_from: before[2].id });
       assertEventShape(res.events, "done");
       const after = await getChat(open, chat.id);
       assert.deepEqual(after.messages.slice(0, 2), before.slice(0, 2));
@@ -1650,11 +1761,11 @@ describe("open stack", () => {
 
     test("replace_from with new content edits and resends", async () => {
       const chat = await createChat(open);
-      await turn(open, chat.id, { content: "original question", think: false });
-      await turn(open, chat.id, { content: "follow-up", think: false });
+      await turn(open, chat.id, { content: "original question", think: false, web: false });
+      await turn(open, chat.id, { content: "follow-up", think: false, web: false });
       const [firstUser] = (await getChat(open, chat.id)).messages;
 
-      const res = await turn(open, chat.id, { content: "edited question", think: false, replace_from: firstUser.id });
+      const res = await turn(open, chat.id, { content: "edited question", think: false, web: false, replace_from: firstUser.id });
       assert.equal(res.events[0].chat.message_count, 1);
       assert.equal(res.events[0].chat.title, "original question", "the title stays once set");
       const after = await getChat(open, chat.id);

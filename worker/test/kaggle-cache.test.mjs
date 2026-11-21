@@ -15,8 +15,10 @@ function memoryDb(initial = {}) {
     prepare(sql) {
       return {
         async run() {
-          assert.equal(sql, "DELETE FROM state WHERE k = 'server_log:kaggle'");
-          return { meta: { changes: rows.delete("server_log:kaggle") ? 1 : 0 } };
+          // A start clears the old Kaggle log, and why the last server stopped.
+          const keys = { "DELETE FROM state WHERE k = 'server_log:kaggle'": ["server_log:kaggle"], "DELETE FROM state WHERE k IN ('server_stop', 'kaggle_run_check')": ["server_stop", "kaggle_run_check"] }[sql];
+          assert.ok(keys, sql);
+          return { meta: { changes: keys.filter((key) => rows.delete(key)).length } };
         },
         bind(...values) {
           return {

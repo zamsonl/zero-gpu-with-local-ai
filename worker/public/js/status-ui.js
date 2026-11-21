@@ -5,10 +5,17 @@
 
 import { h, icon, isTouch } from "./dom.js";
 import { closePopover, openPopover } from "./popover.js";
-import { BOOT_STEPS, STAGES, activeBoot, describe } from "./server-status.js";
+import { BOOT_STEPS, STAGES, activeBoot, describe, describeStop } from "./server-status.js";
 import { openServerLog } from "./server-log.js";
 import { createStartupLog } from "./server-log-feed.js";
 import { clock, timeAgo } from "./time.js";
+import { quotaLeft } from "./telemetry.js";
+
+/** " 7 h 48 min of Kaggle GPU time left this week." for the Start chooser, when Kaggle said. */
+function quotaNote(quota) {
+  const left = quotaLeft(quota);
+  return left ? ` ${left.text} of Kaggle GPU time left this week.` : "";
+}
 
 // The host picked last on this device, offered first next time.
 const LAST_HOST_KEY = "qwen.start-host";
@@ -106,6 +113,11 @@ export class StatusView {
 
     this.colabLink.prepend(icon("power", "icon start-icon"));
     this.colabLink.append(icon("external", "icon colab-icon"));
+    // The header control is a link (Open Kaggle/Colab) that doubles as the Start button. A link is
+    // draggable: a press that moved a few pixels started a link drag, so no click ever came and
+    // nothing started. It is never dragged, and while it starts it is a plain button (no href).
+    this.colabLink.draggable = false;
+    this.colabLink.addEventListener("dragstart", (event) => event.preventDefault());
     this.colabLink.addEventListener("click", (event) => {
       // With no server running, the header button asks where to start one.
       if (this.colabLink.dataset.mode === "start") {
@@ -115,6 +127,12 @@ export class StatusView {
         this.#revealForLaunch();
         this.status.restartWait();
       }
+    });
+    this.colabLink.addEventListener("keydown", (event) => {
+      // As a button (no href) Enter and Space don't click by themselves.
+      if (this.colabLink.hasAttribute("href") || (event.key !== "Enter" && event.key !== " ")) return;
+      event.preventDefault();
+      this.colabLink.click();
     });
     this.pill.addEventListener("click", () => this.#openPanel());
     status.addEventListener("change", () => this.render());
@@ -167,7 +185,22 @@ export class StatusView {
 
   #applyUrls({ colab, kaggle }) {
     this.urls = { colab: colab || this.urls.colab, kaggle: kaggle || null };
-    this.colabLink.href = this.#launchUrl(this.#primaryHost());
+    if (this.colabLink.dataset.mode !== "start") this.colabLink.href = this.#launchUrl(this.#primaryHost());
+  }
+
+  /** Start is a button (no link to drag, long-press or open in a tab); Open is a link to the notebook. */
+  #linkIsButton(button) {
+    if (button) {
+      this.colabLink.removeAttribute("href");
+      this.colabLink.removeAttribute("target");
+      this.colabLink.setAttribute("role", "button");
+      this.colabLink.setAttribute("tabindex", "0");
+      this.colabLink.setAttribute("aria-haspopup", "menu");
+    } else {
+      this.colabLink.href = this.#launchUrl(this.#primaryHost());
+      this.colabLink.target = "_blank";
+      for (const name of ["role", "tabindex", "aria-haspopup", "aria-expanded"]) this.colabLink.removeAttribute(name);
+    }
   }
 
   #primaryHost() {
@@ -208,7 +241,7 @@ export class StatusView {
         ? `2 × T4 · ${this.status.status.num_ctx.toLocaleString()}-token window · pictures too`
         : "2 × T4 · context selected to fit the GPUs · pictures too",
       canKaggle
-        ? "Starts from here and runs in the background for up to 12 hours, even with this page closed. Check Kaggle for your remaining GPU quota."
+        ? `Starts from here and runs in the background for up to 12 hours, even with this page closed.${quotaNote(this.status.status?.kaggle_quota)}`
         : "Needs your Kaggle API token saved on the server.",
       { disabled: !canKaggle, onPick: () => this.#startKaggle() },
     );
@@ -323,6 +356,7 @@ export class StatusView {
     const booting = boot && boot.stage !== "failed";
     const startMode = down && !booting;
     this.colabLink.dataset.mode = startMode ? "start" : "open";
+    this.#linkIsButton(startMode);
     this.colabLink.querySelector(".colab-label").textContent =
       this.starting || booting ? "Starting…" : startMode ? "Start" : `Open ${HOSTS[this.#primaryHost()].name}`;
     this.colabLink.classList.toggle("is-urgent", down && !booting);
@@ -334,7 +368,7 @@ export class StatusView {
     const server = this.status.status?.server;
     const wait = this.status.wait;
     const boot = activeBoot(this.status.status);
-    const show = Boolean(boot) || server === "offline" || server === "unregistered" || (wait && server === "idle");
+    const show = Boolean(boot) || server === "offline" || server === "unregistered" || server === "reconnecting" || (wait && server === "idle");
     const failureKey = startupFailureKey(boot);
     // A new real startup failure must surface, even if an older offline notice
     // was hidden. Dismissing that same failure survives polls and tab refreshes.
@@ -355,18 +389,26 @@ export class StatusView {
       this.#renderBoot(boot);
       return;
     }
+    if (server === "reconnecting") {
+      this.#renderReconnecting();
+      return;
+    }
     const stage = wait?.stage ?? "offline";
     // Colab was opened from here a moment ago: say what to do in that tab while this page waits.
     const colabWaiting = this.colabOpenedAt && Date.now() - this.colabOpenedAt < 15 * 60_000;
     if (!colabWaiting) this.#stopLog();
+    // Why the last server stopped, when it said (or Kaggle did), replaces the generic heading.
+    const stop = stage === "loading" || colabWaiting ? null : describeStop(this.status.status?.last_stop);
     const title =
-      stage === "loading" ? "The server is up. Loading the model…" : colabWaiting ? "Waiting for the Colab notebook" : "The model server isn't running";
+      stage === "loading" ? "The server is up. Loading the model…" : colabWaiting ? "Waiting for the Colab notebook" : stop ? stop.title : "The model server isn't running";
     const text =
       stage === "loading"
         ? "The notebook is starting the model. This page switches to Ready by itself."
         : colabWaiting
           ? HOSTS.colab.start()
-          : "Start it on Kaggle or use the updated Colab notebook for chat, vision and pictures. Kaggle runs in the background; Colab needs enough GPU memory and its notebook kept connected. This page connects when Qwen is ready.";
+          : stop
+            ? `Start it again on Kaggle, or use the updated Colab notebook. This page connects when Qwen is ready.${this.status.status?.last_stop?.at ? ` It stopped ${timeAgo(this.status.status.last_stop.at)}.` : ""}`
+            : "Start it on Kaggle or use the updated Colab notebook for chat, vision and pictures. Kaggle runs in the background; Colab needs enough GPU memory and its notebook kept connected. This page connects when Qwen is ready.";
     const open = h(
       "div",
       { class: "banner-actions" },
@@ -395,6 +437,28 @@ export class StatusView {
         colabWaiting ? this.#liveLog("colab", this.colabOpenedAt) : null,
       ),
       stage === "loading" ? null : open,
+    );
+    this.#tickBanner();
+  }
+
+  /**
+   * The notebook is alive (it checked in moments ago) but its tunnel doesn't answer: it is replacing
+   * the tunnel (or restarting the model server) by itself. Starting another run would make Kaggle
+   * cancel this one, so there is no Start here, only its log.
+   */
+  #renderReconnecting() {
+    this.#stopLog();
+    const host = HOSTS[this.status.status?.host] ? this.status.status.host : this.#primaryHost();
+    this.banner.replaceChildren(
+      h("div", { class: "banner-icon", "aria-hidden": "true" }, icon("think")),
+      h(
+        "div",
+        { class: "banner-body" },
+        this.#bannerHeading("Reconnecting to the notebook…"),
+        h("p", { class: "banner-text", text: `The ${HOSTS[host].name} notebook is still running: it checked in moments ago, but its connection isn't answering. It reconnects by itself, usually within a few minutes; no need to start it again.` }),
+        h("div", { class: "banner-meta" }, h("span", { class: "banner-timer", "aria-live": "off" })),
+      ),
+      h("div", { class: "banner-actions" }, this.#logLink("Show the full log", host)),
     );
     this.#tickBanner();
   }
@@ -468,6 +532,9 @@ export class StatusView {
     if (status?.target_registered_at) rows.push(["Server", `${HOSTS[status.host]?.name ?? "Colab"}, connected ${timeAgo(status.target_registered_at)}`]);
     if (status?.target_registered_at) rows.push(["Pictures", status.vision ? "Can see pictures you attach" : "Text and PDFs only"]);
     if (status?.busy) rows.push([status.busy.operation === "compact" ? "Compacting since" : "Generating since", timeAgo(status.busy.since)]);
+    if (status?.last_stop?.at && ["offline", "unregistered"].includes(status.server)) rows.push(["Stopped", timeAgo(status.last_stop.at)]);
+    const left = quotaLeft(status?.kaggle_quota);
+    if (left) rows.push(["Kaggle GPU left", `${left.text} of ${left.of}${left.resets ? ` · ${left.resets}` : ""}`]);
 
     const refresh = h("button", { class: "button", type: "button", text: "Check again" });
     const stop = this.status.busyElsewhere && this.onStop

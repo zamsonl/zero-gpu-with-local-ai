@@ -1,6 +1,8 @@
 // What the page knows about a model server beyond "is it up": how far a notebook has got while it
-// starts (D1 `state` row k='boot', posted by the notebook), and a request to shut the running one
-// down (k='shutdown', read by the notebook when it polls /_relay/command).
+// starts (D1 `state` row k='boot', posted by the notebook), a request to shut the running one
+// down (k='shutdown', read by the notebook when it polls /_relay/command), the notebook's latest
+// check-in from that poll (k='server_idle'), and why the last server stopped (k='server_stop',
+// from its sign-off or a failed start-up).
 
 import { HttpError } from "./http.js";
 import { imageCommand } from "./images.js";
@@ -11,7 +13,15 @@ import { nowIso } from "./util.js";
 // "queued" is written by the Worker when it asks Kaggle to start a run; the notebook reports the rest.
 export const BOOT_STAGES = ["queued", "installing", "downloading", "loading", "connecting", "failed"];
 // A notebook reports at least every 30 s while it starts; older news means it stopped reporting.
+// A failed start-up is the exception: it stays on the page until the next start.
 const BOOT_FRESH_MS = 10 * 60_000;
+// A running notebook polls /_relay/command every ~10 s. A check-in this recent means it is alive even
+// when its tunnel doesn't answer; one that said its tunnel is being replaced counts for longer
+// (opening a new tunnel can take a few minutes, and the notebook can't poll meanwhile).
+export const CHECKIN_FRESH_MS = 90_000;
+const RECONNECT_FRESH_MS = 5 * 60_000;
+// Why a server stopped, as its notebook says when it signs off (POST /_relay/unregister).
+export const STOP_REASONS = ["idle", "requested", "replaced", "runtime_limit", "tunnel_failed", "crashed", "terminated"];
 
 export async function readState(db, k) {
   const row = await db.prepare("SELECT v FROM state WHERE k = ?1").bind(k).first();
@@ -35,24 +45,42 @@ export function writeBoot(db, boot) {
 }
 
 /**
- * The start-up the page should show: the latest report, if it is recent and came after the server
- * that is registered now (once the new server registers, its start-up is over).
+ * The start-up the page should show: the latest report, if it is recent (a failure: until the next
+ * start) and came after the server that is registered now (once the new server registers, its
+ * start-up is over).
  */
 export async function currentBoot(db, registered) {
   const boot = await readState(db, "boot");
   if (!boot) return null;
   const at = Date.parse(boot.at);
-  if (!(Date.now() - at < BOOT_FRESH_MS)) return null;
+  if (boot.stage !== "failed" && !(Date.now() - at < BOOT_FRESH_MS)) return null;
   if (registered && Date.parse(registered.at) >= at) return null;
   return { host: boot.host, stage: boot.stage, detail: boot.detail ?? null, percent: boot.percent ?? null, at: boot.at };
 }
 
 /**
  * A server from `host` registered or signed off: its start-up is over, so its progress report goes
- * (otherwise a fresh report would show "starting" again once the server had signed off).
+ * (otherwise a fresh report would show "starting" again once the server had signed off). A sign-off
+ * keeps a failure the notebook reported (`keepFailed`): the page shows it until the next start.
  */
-export async function endBoot(db, host) {
-  await db.prepare("DELETE FROM state WHERE k = 'boot' AND json_extract(v, '$.host') = ?1").bind(host).run();
+export async function endBoot(db, host, { keepFailed = false } = {}) {
+  await db
+    .prepare(`DELETE FROM state WHERE k = 'boot' AND json_extract(v, '$.host') = ?1${keepFailed ? " AND json_extract(v, '$.stage') IS NOT 'failed'" : ""}`)
+    .bind(host)
+    .run();
+}
+
+/**
+ * Why the server stopped: `{ reason, detail, uptime_s, idle_minutes, host }` (a sign-off) or
+ * `{ reason: "start_failed", detail, host }` (a failed start-up). Kept until a server registers or
+ * the page starts one.
+ */
+export function writeStop(db, stop) {
+  return writeState(db, "server_stop", stop);
+}
+
+export async function clearStop(db) {
+  await db.prepare("DELETE FROM state WHERE k IN ('server_stop', 'kaggle_run_check')").run();
 }
 
 /** POST /v1/server/shutdown: asks the running notebook to stop; it checks about once a minute. */
@@ -63,6 +91,7 @@ export async function requestShutdown({ env }) {
     throw new HttpError(409, "unsupported", "This server can't be shut down from here. Stop it in its notebook.");
   }
   await writeState(env.DB, "shutdown", { target: registered.target });
+  await refreshQuotaSoon(env.DB);
   return Response.json({ ok: true, shutdown: "requested" });
 }
 
@@ -97,53 +126,31 @@ export async function commandFor(db, env, target) {
   return { shutdown: requested, reason: requested ? "requested" : null, registered: true, idle_minutes, ...images };
 }
 
-// ---------------------------------------------------------------- GPU time and the idle countdown
-//
-// Kaggle gives 30 GPU hours a week. Each run is recorded from its first report (the machine is
-// up) to its sign-off or failure (D1 `state` row k='kaggle_sessions'), so the page can show the
-// hours used in the last 7 days. A run that vanished without signing off counts up to Kaggle's
-// 12-hour limit.
+// ---------------------------------------------------------------- check-ins and the idle countdown
 
-const SESSION_CAP_MS = 12 * 3600_000;
-const WEEK_MS = 7 * 24 * 3600_000;
-
-async function sessions(db) {
-  return (await readState(db, "kaggle_sessions"))?.list ?? [];
+/**
+ * The notebook's check-in with each /_relay/command poll: how long nobody has used it, and whether
+ * it is replacing its tunnel (`tunnel: "reconnecting"`).
+ */
+export async function recordIdle(db, target, idleSeconds, tunnel = null) {
+  await writeState(db, "server_idle", { target, idle_s: idleSeconds, ...(tunnel ? { tunnel } : {}) });
 }
 
-/** A Kaggle run has started (its first progress report); opens a session unless one is open. */
-export async function openKaggleSession(db) {
-  const list = await sessions(db);
-  const now = Date.now();
-  const open = list.find((s) => !s.end && now - Date.parse(s.start) < SESSION_CAP_MS);
-  if (open) return;
-  const kept = list.filter((s) => now - Date.parse(s.end ?? s.start) < 2 * WEEK_MS);
-  await writeState(db, "kaggle_sessions", { list: [...kept, { start: nowIso(), end: null }] });
+/** True when the registered notebook checked in recently: it is alive, whatever its tunnel says. */
+export async function freshCheckin(db, registered) {
+  if (!registered?.target) return false;
+  const idle = await readState(db, "server_idle");
+  if (!idle || idle.target !== registered.target) return false;
+  const age = Date.now() - Date.parse(idle.at);
+  return age >= 0 && age < (idle.tunnel === "reconnecting" ? RECONNECT_FRESH_MS : CHECKIN_FRESH_MS);
 }
 
-/** The Kaggle run ended (signed off or failed): closes the open session. */
-export async function closeKaggleSession(db) {
-  const list = await sessions(db);
-  if (!list.some((s) => !s.end)) return;
-  const end = nowIso();
-  await writeState(db, "kaggle_sessions", { list: list.map((s) => (s.end ? s : { ...s, end })) });
-}
-
-/** Hours of Kaggle GPU time in the last 7 days, to one decimal. */
-export async function gpuHoursThisWeek(db) {
-  const now = Date.now();
-  let ms = 0;
-  for (const s of await sessions(db)) {
-    const start = Date.parse(s.start);
-    const end = Math.min(s.end ? Date.parse(s.end) : now, start + SESSION_CAP_MS, now);
-    ms += Math.max(0, end - Math.max(start, now - WEEK_MS));
-  }
-  return Math.round((ms / 3600_000) * 10) / 10;
-}
-
-/** The notebook's report of how long nobody has used it (sent with each /_relay/command poll). */
-export async function recordIdle(db, target, idleSeconds) {
-  await writeState(db, "server_idle", { target, idle_s: idleSeconds });
+/**
+ * The Kaggle GPU quota (see kaggle-quota.js) is read again soon after a server starts or stops,
+ * when Kaggle's own count has caught up, instead of waiting out its cache.
+ */
+export async function refreshQuotaSoon(db, inMs = 30_000) {
+  await writeState(db, "kaggle_quota_due", { due_at: new Date(Date.now() + inMs).toISOString() });
 }
 
 /**

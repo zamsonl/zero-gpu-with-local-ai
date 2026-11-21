@@ -1,12 +1,13 @@
 // The instrument readouts. The header shows the estimated next input and reply speeds
-// (a sparkline of the recent ones). In the sidebar: the model badge, Kaggle GPU hours used this
-// week and when an idle server will shut itself down. On the start screen: the same facts as tiles.
-// Fed by the server status and the open chat's messages.
+// (a sparkline of the recent ones). In the sidebar: the model badge, the Kaggle GPU time left this
+// week (Kaggle's own count, status.kaggle_quota) and when an idle server will shut itself down. On the
+// start screen: the same facts as tiles. Fed by the server status and the open chat's messages.
 
 import { h } from "./dom.js";
 
-const GPU_WEEK_HOURS = 30;
 const SPARK_POINTS = 16;
+// Less Kaggle GPU time than this left for the week shows as a warning.
+const QUOTA_LOW_S = 3 * 3600;
 const EFFORT_NAMES = { true: "Deep", medium: "Balanced", low: "Quick", false: "Off" };
 
 /** "8.2K" for token counts. */
@@ -18,6 +19,34 @@ export function tokensShort(n) {
 /** What the saved `think` value of a reply was called in the picker. */
 export function effortName(think) {
   return EFFORT_NAMES[String(think)] ?? null;
+}
+
+/** "7 h 48 min", "45 min", "30 h" for a number of seconds (rounded down to the minute). */
+export function hoursMinutes(seconds) {
+  const minutes = Math.max(0, Math.floor(seconds / 60));
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return hours && rest ? `${hours} h ${rest} min` : hours ? `${hours} h` : `${rest} min`;
+}
+
+/** "resets Sat 21 Nov, 08:00": Kaggle's weekly reset, in the viewer's own time. */
+export function quotaReset(iso) {
+  const date = new Date(iso ?? "");
+  if (Number.isNaN(date.getTime())) return "";
+  const weekday = date.toLocaleDateString(undefined, { weekday: "short" });
+  const month = date.toLocaleDateString(undefined, { month: "short" });
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return `resets ${weekday} ${date.getDate()} ${month}, ${time}`;
+}
+
+/**
+ * The Kaggle GPU time left, as the page shows it: `{ text: "7 h 48 min", of: "30 h", share, low,
+ * resets }`, or null when Kaggle hasn't said (or isn't set up).
+ */
+export function quotaLeft(quota) {
+  if (!quota || !(quota.total_s > 0) || !Number.isFinite(quota.remaining_s)) return null;
+  const remaining = Math.max(0, quota.remaining_s);
+  return { text: hoursMinutes(remaining), of: hoursMinutes(quota.total_s), share: remaining / quota.total_s, low: remaining < QUOTA_LOW_S, resets: quotaReset(quota.refreshes_at) };
 }
 
 export class Telemetry {
@@ -101,11 +130,12 @@ export class Telemetry {
   #renderMeters() {
     const status = this.#status.status;
     const rows = [];
-    if (typeof status?.gpu_hours_week === "number") {
-      const hours = status.gpu_hours_week;
-      const tracked = meter("Tracked serving time", `${hours.toFixed(1)} h`, hours / GPU_WEEK_HOURS, hours > GPU_WEEK_HOURS * 0.85 ? "warn" : "accent");
-      tracked.title = "This week's Kaggle serving sessions recorded by this app. Manual runs and probes are excluded; check Kaggle for remaining quota.";
-      rows.push(tracked);
+    const left = quotaLeft(status?.kaggle_quota);
+    if (left) {
+      const quota = status.kaggle_quota;
+      const gpu = meter("Kaggle GPU left", `${left.text} of ${left.of}`, left.share, left.low ? "warn" : "accent", left.resets);
+      gpu.title = `Kaggle's own count for this account: ${hoursMinutes(quota.used_s)} used${quota.reserved_s ? `, ${hoursMinutes(quota.reserved_s)} held by a running notebook` : ""}.${left.resets ? ` It ${left.resets} (your time).` : ""}${quota.fetched_at ? ` Checked with Kaggle at ${new Date(quota.fetched_at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}.` : ""}`;
+      rows.push(gpu);
     }
     if (status?.idle_shutdown_at && status.server === "ready") {
       const left = Math.max(0, Date.parse(status.idle_shutdown_at) - Date.now());
@@ -127,23 +157,22 @@ export class Telemetry {
     const pictures = status?.server === "images";
     const set = (name, value, note) => {
       const tile = tiles.querySelector(`[data-tile="${name}"]`);
+      if (!tile) return;
       tile.querySelector(".tile-value").textContent = value;
       tile.querySelector(".tile-note").textContent = note;
     };
     if (pictures) set("server", host, "Making pictures; chat is paused");
+    else if (status?.server === "reconnecting") set("server", "Reconnecting", "The notebook is still running; its connection is coming back");
     else set("server", up ? host : status?.boot && status.boot.stage !== "failed" ? "Starting" : "Offline", up ? "Ready to answer" : status?.can_start ? "Start it from the banner below" : "Start the notebook");
     const active = up || pictures;
     set("memory", active && status?.num_ctx ? `${status.num_ctx.toLocaleString()} tokens` : "—", active ? "Total window, shared by input and replies" : "Confirmed when the server connects");
     set("pictures", active ? (status?.vision ? "On" : "Off") : "—", active && status?.vision ? "Attach a picture to ask about it" : active ? "Text, code and PDFs" : "Vision is checked when chat starts");
-    set(
-      "gpu",
-      typeof status?.gpu_hours_week === "number" ? `${status.gpu_hours_week.toFixed(1)} h tracked` : "—",
-      typeof status?.gpu_hours_week === "number" ? "Serving sessions only; check Kaggle for quota" : "Kaggle isn't set up",
-    );
+    const left = quotaLeft(status?.kaggle_quota);
+    set("gpu", left ? `${left.text} left` : "—", left ? `Kaggle GPU time of ${left.of}${left.resets ? `; ${left.resets}` : ""}` : status?.can_start ? "Waiting for Kaggle's count" : "Kaggle isn't set up");
   }
 }
 
-function meter(name, value, share, tone) {
+function meter(name, value, share, tone, note = "") {
   const fill = h("span", { class: "meter-fill" });
   fill.style.setProperty("--fill", `${Math.max(0, Math.min(1, share)) * 100}%`);
   return h(
@@ -151,6 +180,7 @@ function meter(name, value, share, tone) {
     { class: "meter", dataset: { tone } },
     h("div", { class: "meter-row" }, h("span", { class: "meter-name", text: name }), h("span", { class: "meter-value", text: value })),
     h("span", { class: "meter-track", "aria-hidden": "true" }, fill),
+    note ? h("span", { class: "meter-note", text: note }) : null,
   );
 }
 

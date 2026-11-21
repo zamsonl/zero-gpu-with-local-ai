@@ -112,7 +112,9 @@ test("oversized message is rejected before persistence and preview uses the same
 test("compaction preserves transcript/export/search and subsequent turns use memory plus suffix", async () => {
   const id = await importedChat();
   const original = (await call("GET", `/v1/chats/${id}`)).body.messages;
-  const before = (await preview(id)).body.context;
+  // Compaction reports the plain history plan; compare it with the preview without web tools,
+  // whose room for web results would otherwise make the "before" plan smaller.
+  const before = (await preview(id, { web: false })).body.context;
   assert(before.would_omit_history && before.can_compact);
   const result = await compact(id);
   assert.equal(result.events.at(-1).event, "done", JSON.stringify(result.events));
@@ -123,7 +125,7 @@ test("compaction preserves transcript/export/search and subsequent turns use mem
   assert(exported.includes("original-0"));
   const searched = await call("GET", "/v1/chats?q=original-0");
   assert(searched.body.chats.some((chat) => chat.id === id));
-  const sent = await call("POST", `/v1/chats/${id}/turn`, { content: "Next request", think: false });
+  const sent = await call("POST", `/v1/chats/${id}/turn`, { content: "Next request", think: false, web: false });
   assert.equal(sent.events.at(-1).event, "done");
   const request = stack.mock.lastChat();
   assert(request.messages[0].content.includes("<conversation_summary>"));

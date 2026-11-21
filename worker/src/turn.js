@@ -4,7 +4,7 @@
 import { isImage, parseAttachments } from "./attachments.js";
 import { requireChat } from "./chats.js";
 import { settings } from "./config.js";
-import { mappedTranscript, planContext, readCheckpoint, requireContextSpace } from "./context.js";
+import { WEB_RESERVE_CHARS, mappedTranscript, planContext, readCheckpoint, requireContextSpace } from "./context.js";
 import { startGeneration } from "./generation.js";
 import { HttpError, badRequest, readJsonObject } from "./http.js";
 import { GenerationLock } from "./lock.js";
@@ -54,6 +54,8 @@ export async function turn({ env, ctx, request, params }) {
     const plan = planContext({
       transcript: mappedTranscript([...kept, { role: "user", content: input.content, attachments: input.attachments }], vision),
       numCtx, think: input.think, preferences, checkpoint: await readCheckpoint(db, chat.id),
+      // Web results need room in the context too; history leaves some free for them.
+      toolReserveChars: input.web ? WEB_RESERVE_CHARS : 0,
     });
     requireContextSpace(plan);
     const saved = await saveUserMessage(db, {
@@ -84,6 +86,9 @@ export async function turn({ env, ctx, request, params }) {
       requestContext: plan.context,
       timingScale: config.timingScale,
       signal: request.signal,
+      web: input.web,
+      // Pages of the relay itself are never read by the web tools.
+      selfOrigin: new URL(request.url).origin,
     };
   } catch (err) {
     await lock.release();
@@ -101,11 +106,13 @@ function parseTurn(body) {
   if (body.think != null && typeof body.think !== "boolean" && !THINK_EFFORTS.includes(body.think)) {
     throw badRequest('"think" must be true, false, "medium" or "low".');
   }
+  // Web search and page reading: on unless the client turns it off.
+  if (body.web != null && typeof body.web !== "boolean") throw badRequest('"web" must be true or false.');
   const replaceFrom = body.replace_from ?? null;
   if (replaceFrom !== null && !(Number.isSafeInteger(replaceFrom) && replaceFrom > 0)) {
     throw badRequest('"replace_from" must be a message id.');
   }
-  return { content, attachments, think: body.think ?? true, replaceFrom };
+  return { content, attachments, think: body.think ?? true, web: body.web ?? true, replaceFrom };
 }
 
 /** What an untitled chat is named after: its first message, or the first file's name. */

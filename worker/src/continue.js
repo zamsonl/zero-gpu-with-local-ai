@@ -14,6 +14,7 @@ import { lastMessage, listTranscript } from "./store.js";
 import { readTarget, serverInfo } from "./target.js";
 import { picturesHaveGpu, readMode } from "./images.js";
 import {NDJSON_HEADERS} from './event-stream.js';
+import { webNotes } from "./web-tools.js";
 
 const CONTINUABLE = ["length", "stopped", "error"];
 
@@ -57,11 +58,15 @@ export async function continueReply({ env, ctx, params, request }) {
     const earlier = mappedTranscript((await listTranscript(db, chat.id)).filter((m) => m.id !== last.id));
     const lastUser = earlier.findLast((m) => m.role === "user");
     if (!lastUser) throw badRequest("This reply has no question before it to continue from.");
-    // The unfinished reply always goes in whole; the earlier conversation gets what room is left.
-    const plan = planContext({ transcript: earlier, numCtx, think, preferences, partial, checkpoint: await readCheckpoint(db, chat.id) });
+    // A reply that used web tools carries on with what it found (tools are not offered here).
+    const notes = webNotes(last.stats?.web);
+    // The unfinished reply always goes in whole (with those notes); the earlier conversation gets
+    // what room is left.
+    const plannedPartial = notes ? { ...partial, thinking: (partial.thinking ?? "") + " ".repeat(notes.length + 24) } : partial;
+    const plan = planContext({ transcript: earlier, numCtx, think, preferences, partial: plannedPartial, checkpoint: await readCheckpoint(db, chat.id) });
     const forceRecovery=!!last.thinking&&(effort===false||plan.context.over_budget||!!last.stats?.recovery);
     if(!forceRecovery)requireContextSpace(plan);
-    const messages = plan.messages;
+    const messages = notes ? [...plan.messages, { role: "user", content: notes }] : plan.messages;
     job = {
       db,
       env,
@@ -93,6 +98,7 @@ export async function continueReply({ env, ctx, params, request }) {
       timingScale: config.timingScale,
       requestContext: plan.context,
       signal: request.signal,
+      continuationNotes: notes,
     };
   } catch (err) {
     await lock.release();

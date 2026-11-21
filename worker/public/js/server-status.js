@@ -75,7 +75,8 @@ export class ServerStatus extends EventTarget {
 
   /** Advances the wait for a new server state; true when this observation ends a wait. */
   #track(server) {
-    if (server === "offline" || server === "unregistered") {
+    // A notebook reconnecting its tunnel is waited for too: "Connected" says when it is back.
+    if (server === "offline" || server === "unregistered" || server === "reconnecting") {
       this.wait ??= { startedAt: Date.now(), stage: "offline" };
       this.wait.stage = "offline";
     } else if (server === "idle" && this.wait) {
@@ -117,8 +118,55 @@ export const BOOT_STEPS = {
 /** A notebook start-up worth showing: reported recently and the server isn't serving yet. */
 export function activeBoot(status) {
   const boot = status?.boot;
-  if (!boot || status.server === "ready") return null;
+  if (!boot || status.server === "ready" || status.server === "reconnecting") return null;
   return boot;
+}
+
+const KAGGLE_RUN_STATES = { COMPLETE: "the run finished", ERROR: "the run failed", CANCEL_REQUESTED: "the run was cancelled", CANCEL_ACKNOWLEDGED: "the run was cancelled", CANCELED: "the run was cancelled", CANCELLED: "the run was cancelled" };
+
+/** "45 minutes", "1 hour", "3 h 20 min". */
+function duration(minutes) {
+  if (minutes < 60) return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} h ${rest} min` : `${hours} ${hours === 1 ? "hour" : "hours"}`;
+}
+
+/**
+ * Why the last server stopped (status.last_stop), in plain words: `{ title, short }` — a sentence
+ * for the banner and the status panel, and a few words for the status pill — or null when the
+ * reason isn't known.
+ */
+export function describeStop(stop) {
+  if (!stop?.reason) return null;
+  const detail = typeof stop.detail === "string" && stop.detail.trim() ? stop.detail.trim().replace(/[.\s]+$/, "") : "";
+  const ran = Number.isFinite(stop.uptime_s) && stop.uptime_s >= 60 ? ` It had run for ${duration(Math.round(stop.uptime_s / 60))}.` : "";
+  switch (stop.reason) {
+    case "idle": {
+      const minutes = Number.isInteger(stop.idle_minutes) ? stop.idle_minutes : Number(/(\d+)\s*minutes?/.exec(detail)?.[1]);
+      return { title: Number.isFinite(minutes) && minutes > 0 ? `The server shut down after ${duration(minutes)} unused.` : "The server shut down after a while unused.", short: "shut down when idle" };
+    }
+    case "requested":
+      return { title: "The website asked it to stop.", short: "stopped from this site" };
+    case "replaced":
+      return { title: "Another server took over from it.", short: "replaced" };
+    case "runtime_limit":
+      return { title: `Kaggle's 12-hour limit was reached.${ran}`, short: "12-hour limit" };
+    case "tunnel_failed":
+      return { title: `The notebook lost its tunnel and could not reconnect.${ran}`, short: "tunnel lost" };
+    case "crashed":
+      return { title: `The notebook crashed${detail ? `: ${detail}` : ""}.`, short: "crashed" };
+    case "terminated":
+      return { title: `${detail || "The notebook was stopped"}.`, short: "stopped" };
+    case "kaggle_ended": {
+      const what = KAGGLE_RUN_STATES[stop.status] ?? (stop.status ? `status ${String(stop.status).toLowerCase()}` : "");
+      const words = [what, detail].filter(Boolean).join(": ");
+      return { title: `Kaggle stopped the notebook${words ? `: ${words}` : ""}.`, short: "stopped by Kaggle" };
+    }
+    case "start_failed":
+      return { title: `It stopped while starting${detail ? `: ${detail}` : ""}.`, short: "failed to start" };
+  }
+  return null;
 }
 
 /**
@@ -149,20 +197,27 @@ export function describe(status, busyElsewhere) {
         detail: "",
         summary: "This page can't reach the relay. Check your internet connection; it retries every 5 seconds.",
       };
+    case "reconnecting":
+      return {
+        tone: "warn",
+        label: "Reconnecting",
+        detail: "to the notebook",
+        summary: "Reconnecting to the notebook… It is still running (it checked in moments ago), but its tunnel isn't answering. It replaces the tunnel by itself; don't start another one.",
+      };
     case "unregistered":
+    case "offline": {
+      const stop = describeStop(status.last_stop);
       return {
         tone: "err",
         label: "Offline",
-        detail: "",
-        summary: "No model server has connected yet. Start the Kaggle or Colab notebook.",
+        detail: stop?.short ?? "",
+        summary: stop
+          ? `${stop.title} Start it again when you need it.`
+          : status.server === "unregistered"
+            ? "No model server has connected yet. Start the Kaggle or Colab notebook."
+            : "The notebook isn't running, or its tunnel dropped. Start it again.",
       };
-    case "offline":
-      return {
-        tone: "err",
-        label: "Offline",
-        detail: "",
-        summary: "The notebook isn't running, or its tunnel dropped. Start it again.",
-      };
+    }
   }
   const mode = status.mode;
   if (mode?.state === "switching") {

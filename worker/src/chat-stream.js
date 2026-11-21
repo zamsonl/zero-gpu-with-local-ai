@@ -191,7 +191,8 @@ function isRetryableStatus(status) {
 }
 
 function isFirstToken(chunk) {
-  return Boolean(chunk.done || chunk.message?.content || chunk.message?.thinking);
+  // A reply without reasoning can open with a tool call (web search) and no text at all.
+  return Boolean(chunk.done || chunk.message?.content || chunk.message?.thinking || chunk.message?.tool_calls?.length);
 }
 
 async function errorText(response) {

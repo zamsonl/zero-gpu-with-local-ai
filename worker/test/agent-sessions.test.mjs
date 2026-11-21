@@ -231,10 +231,12 @@ test('a queued personal launch can be marked cancelled before any target registe
 });
 test('agent-only notebook exits before downloads when cancelled, and enforces idle cutoff without relay',()=>{
   const program=String.raw`
-import ast, pathlib, time, urllib.parse
+import ast, pathlib, time, urllib.parse, urllib.error
 source=pathlib.Path('src/kaggle-server.py').read_text(encoding='utf-8')
 tree=ast.parse(source)
-functions={node.name:node for node in tree.body if isinstance(node,ast.FunctionDef)}
+functions={node.name:node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.ClassDef))}
+# serve() signs off with a reason: it needs the Stop helpers and their constants from the same source.
+shared=[node for node in tree.body if isinstance(node,ast.Assign) and any(getattr(target,'id',None) in ('STOP_REASONS','REPLACED_AFTER_401S','TUNNEL_GIVE_UP_S','CURRENT_TARGET','SIGNED_OFF') for target in node.targets)]
 logs=[]
 def forbidden(): raise AssertionError('Cancelled notebook reached model/runtime setup')
 namespace={'RUNTIME_HOST':'kaggle','RELAY_HEADER':'x-launch-token','NotebookLogReporter':lambda *a,**k:object(),'RELAY':'owned','LAUNCH_TOKEN':'owned','time':time,'AGENT_ONLY':True,'log':logs.append,'relay':lambda *a,**k:{'shutdown':True},'models_dir':forbidden}
@@ -254,8 +256,8 @@ def relay(method,path,body=None):
     calls.append((method,path))
     if method=='GET': raise RuntimeError('Relay unavailable')
     return {}
-namespace={'RUNTIME_HOST':'kaggle','time':clock,'urllib':urllib,'AGENT_ONLY':True,'PICTURES':pictures,'BATCH_SIZE':256,'PROFILE_ID':'personal','relay':relay,'report':lambda *a,**k:None,'log':logs.append,'requests_served':lambda:0,'gpu_busy':lambda:False,'STARTED':0,'MAX_RUNTIME_S':24000,'IMAGE_POLL_S':2,'CHAT_POLL_S':10,'TUNNEL_CHECK_S':30}
-exec(compile(ast.Module(body=[functions['serve']],type_ignores=[]),'personal-serve-fixture','exec'),namespace)
+namespace={'RUNTIME_HOST':'kaggle','time':clock,'urllib':urllib,'AGENT_ONLY':True,'PICTURES':pictures,'BATCH_SIZE':256,'PROFILE_ID':'personal','relay':relay,'report':lambda *a,**k:None,'log':logs.append,'public':lambda text:str(text)[:180],'requests_served':lambda:0,'gpu_busy':lambda:False,'STARTED':0,'MAX_RUNTIME_S':24000,'IMAGE_POLL_S':2,'CHAT_POLL_S':10,'TUNNEL_CHECK_S':30}
+exec(compile(ast.Module(body=[*shared,functions['Stop'],functions['unauthorized'],functions['sign_off'],functions['serve']],type_ignores=[]),'personal-serve-fixture','exec'),namespace)
 namespace['serve'](98304,False,'Q5_K_P','owned-target')
 assert pictures.stopped
 assert any('2 hours' in line for line in logs)
@@ -266,7 +268,7 @@ def active_relay(method,path,body=None):
 def hourly_sleep(seconds): clock.current+=3600
 clock.sleep=hourly_sleep
 namespace['relay']=active_relay
-namespace['reachable']=lambda url: True
+namespace['reachable']=lambda url: 'ok'
 namespace['serve'](98304,False,'Q5_K_P','owned-target')
 assert clock.current==10800, clock.current
 assert pictures.stopped

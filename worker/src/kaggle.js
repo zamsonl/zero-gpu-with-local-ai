@@ -22,7 +22,7 @@ import { settings } from "./config.js";
 import { HttpError, json } from "./http.js";
 import { getJson } from "./ollama.js";
 import { readPreferences, writePreference } from "./preferences.js";
-import { currentBoot, writeBoot } from "./server-control.js";
+import { clearStop, currentBoot, freshCheckin, refreshQuotaSoon, writeBoot } from "./server-control.js";
 import { readTarget } from "./target.js";
 import { nowIso } from "./util.js";
 
@@ -99,7 +99,7 @@ function kaggleHeaders(env) {
 }
 
 /** One call to Kaggle's API (api.kaggle.com/v1/<service>/<method>, JSON in and out). */
-async function kaggle(env, service, method, body) {
+export async function kaggle(env, service, method, body, { timeout = 30_000 } = {}) {
   const headers = kaggleHeaders(env);
   let res;
   try {
@@ -107,7 +107,7 @@ async function kaggle(env, service, method, body) {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(timeout),
     });
   } catch {
     throw new HttpError(502, "kaggle", "Kaggle didn't answer. Try again in a minute.");
@@ -194,13 +194,52 @@ async function knownFit(db, env, quant) {
 }
 
 /** What Kaggle says about the latest run: QUEUED, RUNNING, COMPLETE, ERROR… (null if unknown). */
-async function runStatus(env, launch) {
+async function runStatus(env, launch, timeout = 30_000) {
   try {
-    const run = await kaggle(env, "kernels.KernelsApiService", "GetKernelSessionStatus", { userName: launch.user, kernelSlug: launch.slug });
+    const run = await kaggle(env, "kernels.KernelsApiService", "GetKernelSessionStatus", { userName: launch.user, kernelSlug: launch.slug }, { timeout });
     return { status: String(run.status ?? "").toUpperCase() || null, failureMessage: run.failureMessage || null };
   } catch (err) {
     console.error("asking Kaggle about the run failed:", err);
     return { status: null, failureMessage: null };
+  }
+}
+
+// A Kaggle run that has ended, one way or another.
+const ENDED_RUN = ["COMPLETE", "ERROR", "CANCEL_REQUESTED", "CANCEL_ACKNOWLEDGED", "CANCELED", "CANCELLED"];
+// A server that stopped answering is asked about at Kaggle at most this often (status polls are many).
+const RUN_CHECK_MS = 60_000;
+// How long a status poll waits for Kaggle's answer; a slower one lands in D1 for the next poll.
+const RUN_CHECK_WAIT_MS = 2_500;
+
+/**
+ * For a Kaggle server that stopped answering without signing off (and stopped checking in): Kaggle's
+ * own word on the latest run, when it says the run ended — `{ reason: "kaggle_ended", status,
+ * detail, at }` — else null. Kaggle is asked at most once a minute (the answer is kept in D1 `state`
+ * k='kaggle_run_check'); the lookup carries on in the background past a short wait. Never throws.
+ */
+export async function kaggleRunEnded(env, ctx = null) {
+  if (!kaggleConfigured(env)) return null;
+  try {
+    const launch = await readState(env.DB, "launch");
+    if (!launch?.user) return null;
+    let check = await readState(env.DB, "kaggle_run_check");
+    if (check?.launch_at !== launch.at) check = null;
+    const every = RUN_CHECK_MS * settings(env).timingScale;
+    if (!check || !(Date.now() - Date.parse(check.checked_at) < every)) {
+      // Claimed before asking, so the status polls of several open pages don't all ask at once.
+      await writeState(env.DB, "kaggle_run_check", { ...(check ?? {}), launch_at: launch.at, checked_at: nowIso() });
+      const ask = runStatus(env, launch, 10_000).then(async ({ status, failureMessage }) => {
+        if (status) await writeState(env.DB, "kaggle_run_check", { launch_at: launch.at, checked_at: nowIso(), status, failure: failureMessage });
+      }).catch((err) => console.error("asking Kaggle about a silent server failed:", err));
+      ctx?.waitUntil?.(ask);
+      await Promise.race([ask, new Promise((resolve) => setTimeout(resolve, RUN_CHECK_WAIT_MS))]);
+      check = await readState(env.DB, "kaggle_run_check");
+    }
+    if (!check?.status || !ENDED_RUN.includes(check.status)) return null;
+    return { reason: "kaggle_ended", status: check.status, detail: check.failure || null, at: check.checked_at };
+  } catch (err) {
+    console.error("checking a silent Kaggle server failed:", err);
+    return null;
   }
 }
 
@@ -222,6 +261,11 @@ export async function startServer({ env, request }) {
   }
   const datasetDataSources = cacheDataSources(env);
   const registered = await readTarget(db);
+  // A notebook that checked in a moment ago is alive even if its tunnel is slow or being replaced:
+  // a second run would make Kaggle cancel it.
+  if (registered && (await freshCheckin(db, registered))) {
+    throw new HttpError(409, "running", "The notebook is still running (it checked in moments ago); its connection is coming back.");
+  }
   if (registered && (await getJson(registered.target, "/api/version", 4_000))) {
     throw new HttpError(409, "running", "A model server is already running.");
   }
@@ -283,7 +327,10 @@ export async function startServer({ env, request }) {
   });
   await writeState(db, "launches", [...recent, nowIso()]);
   await db.prepare("DELETE FROM state WHERE k = 'server_log:kaggle'").run();
+  // A new start: why the last server stopped (or failed to start) no longer applies.
+  await clearStop(db);
   await writeBoot(db, { host: "kaggle", stage: "queued", detail: "Waiting for Kaggle to assign two GPUs", percent: null });
+  await refreshQuotaSoon(db, 60_000);
   // The Open Kaggle button goes to this notebook's page (its runs and logs) unless another link was set.
   if (!(await readPreferences(db, env)).kaggle_url) await writePreference(db, env, "kaggle_url", page);
   return json({ ok: true, url: page, version: saved.versionNumber ?? null });

@@ -32,7 +32,7 @@ test('New conversation exits Images even when no chat was selected, while an exi
 });
 function composerFixture({readFile=async file=>({name:file.name,type:'text/plain',text:'file body'}),onSend=noop,saved=new Map()}={}){
   const nodes=new Map(),get=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
-  const label=new Element('span');label.className='think-label';get('think').append(label);get('composer').append(get('prompt'));
+  const label=new Element('span');label.className='think-label';get('think').append(label);const webLabel=new Element('span');webLabel.className='web-label';get('web').append(webLabel);get('composer').append(get('prompt'));
   const h=(tag,props={},...children)=>{const el=new Element(tag);for(const[key,value]of Object.entries(props)){if(key==='class')el.className=value;else if(key==='text')el.textContent=value;else if(key==='dataset')Object.assign(el.dataset,value);else el.setAttribute(key,value);}el.append(...children);return el;};
   let menu;
   const window={innerHeight:900,listeners:{},addEventListener(name,fn){(this.listeners[name]??=[]).push(fn);},visualViewport:{height:900,addEventListener:noop}};
@@ -236,4 +236,17 @@ test('resize handle supports keyboard/pointer bounds, stays fixed while typing, 
   handle.emit('keydown',{key:'Home'});assert.equal(ui.get('prompt').style.height,'64px');handle.emit('keydown',{key:'End'});ui.type('many\n'.repeat(500));assert.equal(ui.get('prompt').style.height,'495px');
   ui.window.visualViewport.height=200;ui.window.listeners.resize[0]();assert.equal(ui.get('prompt').style.height,'110px');ui.window.visualViewport.height=900;ui.window.listeners.resize[0]();assert.equal(ui.get('prompt').style.height,'495px');
   assert(![...ui.saved.keys()].some(key=>key.includes('draft')),'Draft content must not enter shared storage.');
+});
+test('Web toggle starts on, turns off per device, and is locked while a reply is generated',()=>{
+  const saved=new Map();
+  const ui=composerFixture({saved});
+  assert.equal(ui.composer.web,true);assert.equal(ui.get('web').getAttribute('aria-pressed'),'true');assert.equal(ui.get('web').querySelector('.web-label').textContent,'Web');
+  ui.get('web').emit('click');
+  assert.equal(ui.composer.web,false);assert.equal(ui.get('web').getAttribute('aria-pressed'),'false');assert.equal(ui.get('web').querySelector('.web-label').textContent,'Web off');assert.equal(saved.get('qwen.web'),'off');
+  // Another visit on this device remembers it; turning it back on clears the stored choice.
+  const again=composerFixture({saved});assert.equal(again.composer.web,false);
+  again.get('web').emit('click');assert.equal(again.composer.web,true);assert.equal(saved.has('qwen.web'),false);
+  again.composer.setGenerating(true);assert.equal(again.get('web').disabled,true);
+  again.get('web').emit('click');assert.equal(again.composer.web,true,'The Web toggle must not change during a reply');
+  again.composer.setGenerating(false);assert.equal(again.get('web').disabled,false);
 });

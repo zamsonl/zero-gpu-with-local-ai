@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -70,6 +71,16 @@ CHUNK_BYTES = 128 * 1024 * 1024
 CHAT_POLL_S = 10
 IMAGE_POLL_S = 2
 TUNNEL_CHECK_S = 30
+# How long the tunnel (or Ollama on this machine) may stay broken, while it is retried, before the
+# run gives up and signs off.
+TUNNEL_GIVE_UP_S = 10 * 60
+# This many 401s in a row from /_relay/command: a newer run has replaced this run's launch token.
+REPLACED_AFTER_401S = 3
+# Why a server stopped, as it tells the website when it signs off (/_relay/unregister).
+STOP_REASONS = ("idle", "requested", "replaced", "runtime_limit", "tunnel_failed", "crashed", "terminated")
+CURRENT_TARGET = None  # the tunnel address the relay has on file for this run
+SIGNED_OFF = False
+MODELS_DIR = None  # Ollama's model store, kept for a restart
 
 IMAGE_REPO = "abenzerps/Qwen-Image-2.1-Uncensored-Quantized"
 IMAGE_FILES = [
@@ -805,18 +816,49 @@ def start_tunnel():
     if not url:
         raise RuntimeError("The Cloudflare tunnel didn't start: " + tail("/tmp/cloudflared.log"))
     for _ in range(45):  # the new hostname takes a few seconds to resolve everywhere
-        if reachable(url):
+        if public_answers(url):
             return url
         time.sleep(2)
     return url
 
 
-def reachable(url):
+def public_answers(url):
+    """The model answers through the public tunnel."""
     try:
         http("GET", url + "/api/version", timeout=15)
         return True
     except Exception:
         return False
+
+
+def local_answers():
+    """The model answers on this machine: the stream proxy the tunnel points at, and Ollama behind it."""
+    for base in (STREAM_PROXY, OLLAMA):
+        try:
+            http("GET", base + "/api/version", timeout=10)
+        except Exception:
+            return False
+    return True
+
+
+def reachable(url):
+    """
+    Where serving is broken, if it is: "ok"; "local" when Ollama or the stream proxy on this machine
+    doesn't answer (a new tunnel wouldn't help: Ollama needs restarting); "public" when only the
+    tunnel doesn't answer. The local server is checked first.
+    """
+    if not local_answers():
+        return "local"
+    return "ok" if public_answers(url) else "public"
+
+
+def restart_ollama(context, load_model=True):
+    """Ollama stopped answering here: starts it again and reloads the chat model (the tunnel stays)."""
+    subprocess.run(["pkill", "-x", os.path.basename(OLLAMA_BIN)], check=False)
+    time.sleep(2)
+    start_ollama(MODELS_DIR)
+    if load_model:
+        load(context)
 
 
 def gpu_busy():
@@ -839,95 +881,225 @@ def requests_served():
         return 0
 
 
-def serve(context, vision, quant, url):
-    mode = "chat"
+class Stop(Exception):
+    """Ends serving, with the reason the website shows (one of STOP_REASONS) and a short detail."""
 
-    def register(url):
-        relay("POST", "/_relay/register", {"target": url, "host": RUNTIME_HOST, "num_ctx": context, "num_batch": BATCH_SIZE, **({"profile_id": PROFILE_ID} if PROFILE_ID else {}), "job_max_leg_seconds": 300, **({"job_control": True} if AGENT_ONLY else {}), "inference_transport": "jobs-v1", "vision": vision, "quant": quant, "control": True, "mode": mode})
-        log(f"READY at {url}: {context // 1024}K context, pictures {'on' if vision else 'off'}, {quant}")
+    def __init__(self, reason, detail="", idle_minutes=None):
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+        self.idle_minutes = idle_minutes
 
-    report("connecting", "Connecting to this page")
-    register(url)
 
-    if not AGENT_ONLY:
-        PICTURES.prepare()  # in the background, so the first switch to pictures is quick
-    served = requests_served()
-    last_used = time.time()
-    last_tunnel_check = time.time()
-    tunnel_failures = 0
-    reason = "the 12-hour limit is near"
-    while time.time() - STARTED < MAX_RUNTIME_S:
-        time.sleep(IMAGE_POLL_S if mode == "images" else CHAT_POLL_S)
-        now_served = requests_served()
-        jobs = globals().get("PERSONAL_JOBS") if AGENT_ONLY else globals().get("OWNER_JOBS")
-        # An accepted request is activity even during quiet CPU/prompt prefill.
-        # Its own polling/runtime reapers still cancel an abandoned or expired job.
-        if now_served != served or (jobs and jobs.busy()) or gpu_busy():
-            served = now_served
-            last_used = time.time()
+def unauthorized(err):
+    """The relay refused this run's launch token (a newer run has replaced it)."""
+    return isinstance(err, urllib.error.HTTPError) and err.code == 401
 
-        # Personal sessions retain a local quota backstop even if the relay is unreachable
-        # or its temporary credentials expire. Owner notebook idle behavior stays unchanged.
-        if AGENT_ONLY and time.time() - last_used >= 120 * 60:
-            reason = "personal coding session had no local client or model activity for 2 hours"
-            break
 
-        try:
-            idle_s = int(time.time() - last_used)
-            jobs = globals().get("PERSONAL_JOBS") if AGENT_ONLY else None
-            active = "".join("&active_generation=" + owner for owner in jobs.active_generations()) if jobs else ""
-            command = relay("GET", f"/_relay/command?target={urllib.parse.quote(url, safe='')}&idle={idle_s}{active}")
-            if jobs and isinstance(command, dict):
-                jobs.cancel_generations(command.get("stop_generations", []))
-        except Exception as err:
-            log(f"couldn't reach the relay: {err}")
-            command = None
-        if command:
-            if command.get("shutdown"):
-                reason = "another server took over" if command.get("reason") == "replaced" else "the website asked it to stop"
-                break
-            if AGENT_ONLY and command.get("client_active") is True:
-                client_idle = command.get("client_idle_seconds")
-                if isinstance(client_idle, (int, float)) and not isinstance(client_idle, bool) and 0 <= client_idle <= 120:
-                    last_used = max(last_used, time.time() - client_idle)
-            if not command.get("registered"):
-                register(url)
-            wanted = command.get("mode") or "chat"
-            if wanted == "images" and mode == "chat":
-                if switch_to_pictures(PICTURES, url, context):
-                    mode = "images"
-                last_used = time.time()
-            elif wanted == "chat" and mode == "images":
-                switch_to_chat(PICTURES, url, context)
-                mode = "chat"
-                last_used = time.time()
-            elif command.get("job") and mode == "images":
-                run_job(command["job"])
-                last_used = time.time()
-            idle = command.get("idle_minutes") or 0
-            if idle and time.time() - last_used > idle * 60:
-                reason = f"nobody used it for {idle} minutes"
-                break
-
-        if time.time() - last_tunnel_check < TUNNEL_CHECK_S:
-            continue
-        last_tunnel_check = time.time()
-        if reachable(url):
-            tunnel_failures = 0
-        else:
-            tunnel_failures += 1
-            if tunnel_failures >= 2:
-                log("The tunnel dropped; opening a new one")
-                url = start_tunnel()
-                register(url)
-                tunnel_failures = 0
-
-    PICTURES.stop()
-    log(f"Shutting down: {reason}.")
+def sign_off(target, reason, detail="", idle_minutes=None):
+    """Tells the relay this server is going, and why, so the page can say so. Once a run; never raises."""
+    global SIGNED_OFF
+    if SIGNED_OFF or not target:
+        return
+    SIGNED_OFF = True
+    body = {"target": target, "reason": reason if reason in STOP_REASONS else "crashed",
+            "detail": public(detail) if detail else "", "uptime_s": int(max(0, time.time() - STARTED))}
+    if reason == "idle" and isinstance(idle_minutes, int) and idle_minutes > 0:
+        body["idle_minutes"] = idle_minutes
     try:
-        relay("POST", "/_relay/unregister", {"target": url})
+        relay("POST", "/_relay/unregister", body)
     except Exception as err:
         log(f"sign-off failed: {err}")
+
+
+def on_terminate(signum, _frame):
+    """SIGTERM (the session is being stopped): unwind like an exit, so serving signs off on the way out."""
+    raise SystemExit(128 + signum)
+
+
+def install_terminate_handler():
+    try:
+        signal.signal(signal.SIGTERM, on_terminate)
+    except (ValueError, OSError, AttributeError):
+        pass  # not the main thread, or no signals here: an exit still signs off, a kill can't
+
+
+def serve(context, vision, quant, url):
+    """
+    Registers the tunnel and serves until a reason to stop (see STOP_REASONS), then signs off with
+    that reason, however serving ended. A tunnel that stops answering is replaced, and Ollama is
+    restarted if it is what stopped answering; both are retried with a growing wait, and serving gives
+    up only after TUNNEL_GIVE_UP_S of trouble.
+    """
+    mode = "chat"
+
+    def register(target):
+        global CURRENT_TARGET
+        relay("POST", "/_relay/register", {"target": target, "host": RUNTIME_HOST, "num_ctx": context, "num_batch": BATCH_SIZE, **({"profile_id": PROFILE_ID} if PROFILE_ID else {}), "job_max_leg_seconds": 300, **({"job_control": True} if AGENT_ONLY else {}), "inference_transport": "jobs-v1", "vision": vision, "quant": quant, "control": True, "mode": mode})
+        CURRENT_TARGET = target
+        log(f"READY at {target}: {context // 1024}K context, pictures {'on' if vision else 'off'}, {quant}")
+
+    def register_until_done(target):
+        """The first registration, retried with a growing wait while the relay can't be reached."""
+        wait, since = 5, time.time()
+        while True:
+            try:
+                return register(target)
+            except Exception as err:
+                if unauthorized(err):
+                    raise Stop("replaced", "The website no longer accepts this notebook's launch token (a newer run replaced it)")
+                if time.time() - since >= TUNNEL_GIVE_UP_S:
+                    raise Stop("tunnel_failed", f"Couldn't register with the website for {TUNNEL_GIVE_UP_S // 60} minutes: {public(err)}")
+                log(f"registering failed ({public(err)}); trying again in {wait} s")
+                time.sleep(wait)
+                wait = min(wait * 2, 60)
+
+    reason, detail, idle_minutes = "crashed", "", None
+    try:
+        report("connecting", "Connecting to this page")
+        register_until_done(url)
+        if not AGENT_ONLY:
+            PICTURES.prepare()  # in the background, so the first switch to pictures is quick
+        served = requests_served()
+        last_used = time.time()
+        next_check = time.time() + TUNNEL_CHECK_S
+        trouble = None  # (what, since) while serving is broken: "local" (Ollama here) or "public" (the tunnel)
+        failures = 0  # failed checks in a row
+        repairs = 0  # repair attempts in this trouble, for the growing wait
+        pending = None  # a new tunnel that is up but not registered yet
+        refused = 0  # 401s in a row from /_relay/command
+
+        def check_and_repair():
+            nonlocal url, trouble, failures, repairs, pending, next_check
+            next_check = time.time() + TUNNEL_CHECK_S
+            if pending:
+                register(pending)
+                url, pending = pending, None
+                trouble, failures, repairs = None, 0, 0
+                return
+            state = reachable(url)
+            if state == "ok":
+                if trouble:
+                    log("The model answers through the tunnel again")
+                trouble, failures, repairs = None, 0, 0
+                return
+            if not trouble or trouble[0] != state:
+                trouble, failures, repairs = (state, time.time()), 0, 0
+            failures += 1
+            if failures < 2:
+                return
+            failures = 0
+            repairs += 1
+            if state == "local":
+                log("Ollama stopped answering on this machine; restarting it (the tunnel is fine)")
+                restart_ollama(context, load_model=mode == "chat")
+            else:
+                log("The tunnel dropped; opening a new one")
+                pending = start_tunnel()
+                register(pending)
+                url, pending = pending, None
+
+        while True:
+            if time.time() - STARTED >= MAX_RUNTIME_S:
+                raise Stop("runtime_limit", "Kaggle's 12-hour session limit was near")
+            time.sleep(IMAGE_POLL_S if mode == "images" else CHAT_POLL_S)
+            now_served = requests_served()
+            jobs = globals().get("PERSONAL_JOBS") if AGENT_ONLY else globals().get("OWNER_JOBS")
+            # An accepted request is activity even during quiet CPU/prompt prefill.
+            # Its own polling/runtime reapers still cancel an abandoned or expired job.
+            if now_served != served or (jobs and jobs.busy()) or gpu_busy():
+                served = now_served
+                last_used = time.time()
+
+            # Personal sessions retain a local quota backstop even if the relay is unreachable
+            # or its temporary credentials expire. Owner notebook idle behavior stays unchanged.
+            if AGENT_ONLY and time.time() - last_used >= 120 * 60:
+                raise Stop("idle", "Personal coding session had no local client or model activity for 2 hours", 120)
+
+            try:
+                idle_s = int(time.time() - last_used)
+                jobs = globals().get("PERSONAL_JOBS") if AGENT_ONLY else None
+                active = "".join("&active_generation=" + owner for owner in jobs.active_generations()) if jobs else ""
+                # While the tunnel is being replaced the page says "reconnecting", not "start it again".
+                tunnel = "&tunnel=reconnecting" if trouble else ""
+                command = relay("GET", f"/_relay/command?target={urllib.parse.quote(url, safe='')}&idle={idle_s}{tunnel}{active}")
+                refused = 0
+                if jobs and isinstance(command, dict):
+                    jobs.cancel_generations(command.get("stop_generations", []))
+            except Exception as err:
+                if unauthorized(err):
+                    refused += 1
+                    if refused >= REPLACED_AFTER_401S:
+                        raise Stop("replaced", "The website stopped accepting this notebook's launch token (a newer run replaced it)")
+                log(f"couldn't reach the relay: {err}")
+                command = None
+            if command:
+                if command.get("shutdown"):
+                    if command.get("reason") == "replaced":
+                        raise Stop("replaced", "Another server took over")
+                    raise Stop("requested", "The website asked it to stop")
+                if AGENT_ONLY and command.get("client_active") is True:
+                    client_idle = command.get("client_idle_seconds")
+                    if isinstance(client_idle, (int, float)) and not isinstance(client_idle, bool) and 0 <= client_idle <= 120:
+                        last_used = max(last_used, time.time() - client_idle)
+                if not command.get("registered") and not pending:
+                    try:
+                        register(url)
+                    except Exception as err:
+                        if unauthorized(err):
+                            raise Stop("replaced", "The website no longer accepts this notebook's launch token (a newer run replaced it)")
+                        log(f"registering again failed ({public(err)}); trying on the next poll")
+                wanted = command.get("mode") or "chat"
+                if wanted == "images" and mode == "chat":
+                    if switch_to_pictures(PICTURES, url, context):
+                        mode = "images"
+                    last_used = time.time()
+                elif wanted == "chat" and mode == "images":
+                    switch_to_chat(PICTURES, url, context)
+                    mode = "chat"
+                    last_used = time.time()
+                elif command.get("job") and mode == "images":
+                    run_job(command["job"])
+                    last_used = time.time()
+                idle = command.get("idle_minutes") or 0
+                if idle and time.time() - last_used > idle * 60:
+                    raise Stop("idle", f"Nobody used it for {idle} minutes", idle)
+
+            if time.time() < next_check:
+                continue
+            try:
+                check_and_repair()
+            except Exception as err:
+                if unauthorized(err):
+                    raise Stop("replaced", "The website no longer accepts this notebook's launch token (a newer run replaced it)")
+                # Try again later, waiting longer each time (30 s, 60 s, then every 2 minutes).
+                wait = min(TUNNEL_CHECK_S * 2 ** max(0, repairs - 1), 120)
+                next_check = time.time() + wait
+                log(f"repairing the connection failed ({public(err)}); trying again in {wait} s")
+            if trouble and time.time() - trouble[1] >= TUNNEL_GIVE_UP_S:
+                if trouble[0] == "local":
+                    raise Stop("crashed", f"Ollama stopped answering on this machine and didn't come back in {TUNNEL_GIVE_UP_S // 60} minutes")
+                raise Stop("tunnel_failed", f"The tunnel stopped answering and no new one worked for {TUNNEL_GIVE_UP_S // 60} minutes")
+    except Stop as stop:
+        reason, detail, idle_minutes = stop.reason, stop.detail, stop.idle_minutes
+    except KeyboardInterrupt:
+        reason, detail = "terminated", "It was stopped in the notebook"
+        raise
+    except SystemExit:
+        reason, detail = "terminated", "Kaggle or Colab ended the notebook's session"
+        raise
+    except Exception as err:
+        reason, detail = "crashed", public(f"{type(err).__name__}: {err}" if not isinstance(err, RuntimeError) else err)
+        raise
+    finally:
+        pictures = globals().get("PICTURES")
+        if pictures is not None:
+            try:
+                pictures.stop()
+            except Exception as err:
+                log(f"stopping pictures failed: {err}")
+        log(f"Shutting down ({reason}){': ' + detail if detail else ''}.")
+        sign_off(CURRENT_TARGET or url, reason, detail, idle_minutes)
 
 
 def main():
@@ -948,8 +1120,10 @@ def main():
                 return
         except Exception:
             raise RuntimeError("Could not confirm the personal coding session. Stopping without loading a model.") from None
+    install_terminate_handler()
     models, free_bytes = models_dir()
-    global PICTURES, PROFILE_ID, KNOWN_VISION
+    global PICTURES, PROFILE_ID, KNOWN_VISION, MODELS_DIR
+    MODELS_DIR = models
     cache = discover_cache(repo=REPO, quant=QUANT, model_name=MODEL, cache_id=CACHE_ID or None)
     cached_model = False
     if cache:
@@ -1012,7 +1186,10 @@ if __name__ == "__main__":
         main()
     except Exception as err:
         final_status = "ERROR"
-        report("failed", public(f"{type(err).__name__}: {err}" if not isinstance(err, RuntimeError) else err))
+        message = public(f"{type(err).__name__}: {err}" if not isinstance(err, RuntimeError) else err)
+        report("failed", message)
+        # Serving signs off by itself; a crash outside it (or a failed sign-off) still says why here.
+        sign_off(CURRENT_TARGET, "crashed", message)
         raise
     finally:
         if OPLOG is not None:

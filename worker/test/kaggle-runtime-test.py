@@ -12,6 +12,7 @@ import stat
 import tarfile
 import tempfile
 import unittest
+import urllib.parse
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
@@ -312,7 +313,7 @@ class LoadStartupTests(unittest.TestCase):
         relay = Mock(side_effect=lambda method, path, *args: {"registered": True, "idle_minutes": 45} if method == "GET" else {})
         runtime.update({"AGENT_ONLY": False, "OWNER_JOBS": jobs, "relay": relay,
                         "STARTED": 1000, "MAX_RUNTIME_S": 3 * 3600, "requests_served": lambda: 0,
-                        "gpu_busy": lambda: False, "PICTURES": Mock(), "reachable": lambda _url: True,
+                        "gpu_busy": lambda: False, "PICTURES": Mock(), "reachable": lambda _url: "ok",
                         "time": SimpleNamespace(time=lambda: now[0], sleep=tick)})
         with self.assertRaises(KeyboardInterrupt):
             runtime["serve"](98304, True, "Q5_K_P", "https://example.trycloudflare.com")
@@ -379,6 +380,225 @@ class LoadStartupTests(unittest.TestCase):
         self.runtime["load"] = Mock(side_effect=[False, True])
         self.assertEqual(self.runtime["load_best"](), 81920)
         self.assertEqual(self.runtime["PROFILE_ID"], profile)
+
+
+class Clock:
+    """A fake clock for serve(): sleeping moves time on at once."""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+        self.sleeps = []
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class ServeLifecycleTests(unittest.TestCase):
+    """serve(): however serving ends, the notebook signs off with the reason the website shows."""
+
+    URL = "https://old-tunnel.trycloudflare.com"
+    NEW_URL = "https://new-tunnel.trycloudflare.com"
+
+    def setUp(self):
+        from types import SimpleNamespace
+        self.runtime = runtime_namespace()
+        self.clock = Clock()
+        self.commands = []
+        self.posts = []
+        self.reply = {"registered": True, "idle_minutes": 0}
+        self.register_errors = []
+        self.runtime.update({
+            "time": SimpleNamespace(time=self.clock.time, sleep=self.clock.sleep, strftime=lambda *_: "00:00:00"),
+            "STARTED": 1000.0, "MAX_RUNTIME_S": 11 * 3600 + 45 * 60, "AGENT_ONLY": False,
+            "requests_served": lambda: 0, "gpu_busy": lambda: False, "PICTURES": Mock(), "OWNER_JOBS": None,
+            "report": Mock(), "log": Mock(), "reachable": Mock(return_value="ok"),
+            "start_tunnel": Mock(side_effect=AssertionError("the tunnel was replaced")),
+            "restart_ollama": Mock(side_effect=AssertionError("Ollama was restarted")),
+            "relay": self.relay,
+        })
+
+    def relay(self, method, path, body=None):
+        if method == "GET":
+            self.commands.append(path)
+            reply = self.reply(path) if callable(self.reply) else self.reply
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+        self.posts.append((path, body))
+        if path == "/_relay/register" and (self.register_errors == "always" or self.register_errors):
+            raise self.register_errors.pop(0) if isinstance(self.register_errors, list) else urllib_error("relay down")
+        return {"ok": True}
+
+    def serve(self):
+        return self.runtime["serve"](98304, True, "Q5_K_P", self.URL)
+
+    def sign_offs(self):
+        return [body for path, body in self.posts if path == "/_relay/unregister"]
+
+    def registered(self):
+        return [body["target"] for path, body in self.posts if path == "/_relay/register"]
+
+    def assertSignedOff(self, reason, target=URL, detail=None):
+        offs = self.sign_offs()
+        self.assertEqual(len(offs), 1, offs)
+        self.assertEqual(offs[0]["target"], target)
+        self.assertEqual(offs[0]["reason"], reason)
+        self.assertIn(offs[0]["reason"], self.runtime["STOP_REASONS"])
+        self.assertEqual(offs[0]["uptime_s"], int(self.clock.now - 1000))
+        if detail:
+            self.assertIn(detail, offs[0]["detail"])
+        self.assertLessEqual(len(offs[0]["detail"]), 200)
+        return offs[0]
+
+    def test_idle_shutdown_says_how_many_minutes_and_how_long_it_ran(self):
+        self.reply = {"registered": True, "idle_minutes": 45}
+        self.serve()
+        off = self.assertSignedOff("idle", detail="Nobody used it for 45 minutes")
+        self.assertEqual(off["idle_minutes"], 45)
+        self.assertGreater(off["uptime_s"], 45 * 60)
+        self.assertTrue(all("&idle=" in path and "tunnel=" not in path for path in self.commands))
+        self.runtime["PICTURES"].stop.assert_called()
+
+    def test_the_website_asking_and_another_server_taking_over_are_told_apart(self):
+        self.reply = {"shutdown": True, "reason": "requested", "registered": True}
+        self.serve()
+        self.assertSignedOff("requested", detail="The website asked it to stop")
+        self.setUp()
+        self.reply = {"shutdown": True, "reason": "replaced", "registered": False}
+        self.serve()
+        self.assertSignedOff("replaced")
+
+    def test_the_twelve_hour_limit(self):
+        self.runtime["MAX_RUNTIME_S"] = 60
+        self.serve()
+        self.assertSignedOff("runtime_limit", detail="12-hour")
+
+    def test_three_refused_polls_in_a_row_mean_a_newer_run_took_the_launch_token(self):
+        refused = HTTPError("https://relay.invalid/_relay/command", 401, "Unauthorized", None, None)
+        script = iter([refused, refused, {"registered": True}, refused, refused, {"registered": True}])
+        self.reply = lambda _path: next(script, {"shutdown": True, "reason": "requested"})
+        self.serve()
+        self.assertSignedOff("requested")
+        self.setUp()
+        self.reply = HTTPError("https://relay.invalid/_relay/command", 401, "Unauthorized", None, None)
+        self.serve()
+        self.assertSignedOff("replaced", detail="newer run")
+        self.assertEqual(len(self.commands), 3)
+
+    def test_registration_is_retried_with_a_growing_wait(self):
+        self.register_errors = [urllib_error("relay down"), urllib_error("relay down")]
+        self.reply = lambda _path: {"shutdown": True, "reason": "requested"}
+        self.serve()
+        self.assertEqual(self.registered(), [self.URL] * 3)
+        self.assertEqual(self.clock.sleeps[:2], [5, 10])
+        self.assertSignedOff("requested")
+
+    def test_registration_that_never_works_gives_up_after_ten_minutes_as_tunnel_failed(self):
+        self.register_errors = "always"
+        self.serve()
+        self.assertSignedOff("tunnel_failed", detail="register")
+        self.assertGreaterEqual(self.clock.now - 1000, self.runtime["TUNNEL_GIVE_UP_S"])
+        self.assertEqual(self.clock.sleeps[:6], [5, 10, 20, 40, 60, 60])
+        self.assertEqual(self.commands, [], "it never served")
+
+    def test_a_dead_tunnel_is_replaced_and_registered_while_the_page_hears_reconnecting(self):
+        self.runtime["reachable"] = Mock(side_effect=["public", "public", "ok", "ok", "ok"])
+        self.runtime["start_tunnel"] = Mock(return_value=self.NEW_URL)
+        quoted = urllib.parse.quote(self.NEW_URL, safe="")
+        self.reply = lambda path: {"shutdown": True, "reason": "requested"} if quoted in path else {"registered": True}
+        self.serve()
+        self.runtime["start_tunnel"].assert_called_once()
+        self.assertEqual(self.registered(), [self.URL, self.NEW_URL])
+        self.assertTrue(any("&tunnel=reconnecting" in path for path in self.commands), self.commands)
+        self.assertSignedOff("requested", target=self.NEW_URL)
+
+    def test_a_dead_ollama_is_restarted_instead_of_replacing_a_working_tunnel(self):
+        restarted = Mock()
+        self.runtime["restart_ollama"] = restarted
+        self.runtime["reachable"] = Mock(side_effect=["local", "local", "ok", "ok", "ok", "ok"])
+        polls = iter(range(100))
+        self.reply = lambda _path: {"shutdown": True, "reason": "requested"} if restarted.called and next(polls) > 3 else {"registered": True}
+        self.serve()
+        restarted.assert_called_once_with(98304, load_model=True)
+        self.runtime["start_tunnel"].assert_not_called()
+        self.assertEqual(self.registered(), [self.URL])
+        self.assertSignedOff("requested")
+
+    def test_a_tunnel_that_cannot_be_replaced_is_retried_then_signs_off_tunnel_failed(self):
+        self.runtime["reachable"] = Mock(return_value="public")
+        self.runtime["start_tunnel"] = Mock(side_effect=RuntimeError("The Cloudflare tunnel didn't start"))
+        self.serve()
+        self.assertSignedOff("tunnel_failed", target=self.URL)
+        attempts = self.runtime["start_tunnel"].call_count
+        self.assertGreaterEqual(attempts, 3)
+        self.assertLessEqual(attempts, 10, "retries wait longer each time")
+        self.assertGreaterEqual(self.clock.now - 1030, self.runtime["TUNNEL_GIVE_UP_S"])
+        self.assertTrue(all("&tunnel=reconnecting" in path for path in self.commands[3:]))
+
+    def test_an_error_while_serving_signs_off_as_crashed_and_still_raises(self):
+        calls = iter(range(100))
+        self.runtime["requests_served"] = lambda: 0 if next(calls) < 3 else (_ for _ in ()).throw(ValueError("disk full"))
+        with self.assertRaises(ValueError):
+            self.serve()
+        self.assertSignedOff("crashed", detail="ValueError: disk full")
+
+    def test_sigterm_unwinds_serving_with_a_terminated_sign_off(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.runtime["on_terminate"](15, None)
+        self.assertEqual(raised.exception.code, 143)
+        self.clock.sleep = Mock(side_effect=[None, SystemExit(143)])
+        self.runtime["time"].sleep = self.clock.sleep
+        with self.assertRaises(SystemExit):
+            self.serve()
+        self.assertSignedOff("terminated")
+
+    def test_sign_off_is_sent_once_and_never_raises(self):
+        self.runtime["relay"] = Mock(side_effect=urllib_error("relay down"))
+        self.runtime["sign_off"](self.URL, "idle", "Nobody used it for 5 minutes", 5)
+        self.runtime["sign_off"](self.URL, "crashed", "again")
+        self.assertEqual(self.runtime["relay"].call_count, 1)
+        body = self.runtime["relay"].call_args.args[2]
+        self.assertEqual((body["reason"], body["idle_minutes"]), ("idle", 5))
+
+    def test_reachable_checks_this_machine_before_the_public_tunnel(self):
+        runtime = runtime_namespace()
+        seen = []
+
+        def http(method, url, *args, **kwargs):
+            seen.append(url)
+            if url.startswith(down[0]):
+                raise urllib_error("refused")
+            return {"version": "x"}
+
+        runtime["http"] = http
+        for down, expected in (([runtime["STREAM_PROXY"]], "local"), ([runtime["OLLAMA"]], "local"), ([self.URL], "public"), (["nothing"], "ok")):
+            seen.clear()
+            self.assertEqual(runtime["reachable"](self.URL), expected)
+            if expected == "local":
+                self.assertFalse(any(url.startswith(self.URL) for url in seen), "a local failure must not test or replace the tunnel")
+
+    def test_a_crash_outside_serving_still_signs_off_from_the_entry_point(self):
+        source = (Path(__file__).resolve().parent.parent / "src" / "kaggle-server.py").read_text(encoding="utf-8")
+        entry = source[source.index('if __name__ == "__main__":'):].replace('if __name__ == "__main__":', "if True:", 1)
+        runtime = self.runtime
+        relay = Mock(return_value={})
+        runtime.update({"main": Mock(side_effect=RuntimeError("Ollama didn't start")), "relay": relay, "OPLOG": None, "CURRENT_TARGET": self.URL})
+        with self.assertRaises(RuntimeError):
+            exec(compile(entry, "<entry-point>", "exec"), runtime)
+        runtime["report"].assert_called_once_with("failed", "Ollama didn't start")
+        relay.assert_called_once()
+        self.assertEqual(relay.call_args.args[:2], ("POST", "/_relay/unregister"))
+        self.assertEqual(relay.call_args.args[2]["reason"], "crashed")
+        self.assertEqual(relay.call_args.args[2]["detail"], "Ollama didn't start")
+
+
+def urllib_error(reason):
+    from urllib.error import URLError
+    return URLError(reason)
 
 
 if __name__ == "__main__":

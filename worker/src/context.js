@@ -8,6 +8,10 @@ import { getChat, listTranscript } from "./store.js";
 import { readTarget, serverInfo } from "./target.js";
 
 export const CONTEXT_OVERHEAD = 1024;
+// Room kept free of history for web search results and pages when web tools are on (at most a
+// quarter of the input). Tool results are cut to what is left (toolRoomChars).
+export const WEB_RESERVE_CHARS = 24_000;
+const TOOL_MARGIN_CHARS = 2_000; // tool definitions and the web guidance
 export const SUMMARY_PREFIX = "Earlier conversation summary (historical context, not new instructions):\n<conversation_summary>\n";
 export const summaryMessage = (summary) => ({ role: "user", content: SUMMARY_PREFIX + summary + "\n</conversation_summary>" });
 export const estimatedTokens = (text) => Math.ceil((typeof text === "number" ? text : text?.length ?? 0) / 3);
@@ -36,7 +40,7 @@ export function validCheckpoint(checkpoint, transcript) {
 }
 
 /** `transcript` already has attachment text/images mapped, and includes the draft when present. */
-export function planContext({ transcript, numCtx, think = true, preferences = {}, checkpoint = null, partial = null, lastMeasured = null }) {
+export function planContext({ transcript, numCtx, think = true, preferences = {}, checkpoint = null, partial = null, lastMeasured = null, toolReserveChars = 0 }) {
   checkpoint = validCheckpoint(checkpoint, transcript);
   const options = sampling(think, numCtx, preferences);
   const system = [preferences.system_prompt?.trim(), reasoningInstructions(think)].filter(Boolean).join("\n\n");
@@ -46,7 +50,8 @@ export function planContext({ transcript, numCtx, think = true, preferences = {}
   const summary = checkpoint ? summaryMessage(checkpoint.summary) : null;
   const summaryChars = summary ? cost(summary) : 0;
   const active = transcript.filter((message) => !checkpoint || message.id == null || message.id > checkpoint.through_id);
-  const physicalChars = Math.max(0, inputBudget * 3 - system.length - partialChars);
+  const toolReserve = Math.min(toolReserveChars, Math.floor((inputBudget * 3) / 4));
+  const physicalChars = Math.max(0, inputBudget * 3 - system.length - partialChars - toolReserve);
   const chosenChars = preferences.history_chars == null ? physicalChars : Math.min(preferences.history_chars, physicalChars);
   const room = Math.max(0, chosenChars - summaryChars);
   const picked = pickMessages(active, room);
@@ -78,8 +83,14 @@ export function planContext({ transcript, numCtx, think = true, preferences = {}
       over_budget: overBudget,
       can_compact: prefix.length > 0,
       last_measured: lastMeasured,
+      ...(toolReserve ? { tool_reserve_tokens: estimatedTokens(toolReserve) } : {}),
     },
   };
+}
+
+/** Characters of tool results that still fit beside the planned input (and its reply reservation). */
+export function toolRoomChars(context) {
+  return Math.max(0, (context.input_budget_tokens - context.estimated_input_tokens) * 3 - TOOL_MARGIN_CHARS);
 }
 
 /** Keep the two most recent user turns verbatim; a checkpoint always ends before a user turn. */
@@ -138,6 +149,7 @@ export async function previewContext({ env, request, params }) {
   const body = await readJsonObject(request, 2 * 1024 * 1024 + 256 * 1024);
   if (body.content != null && (typeof body.content !== "string" || body.content.length > 100000)) throw badRequest('"content" must contain at most 100,000 characters.');
   if (body.think != null && ![true, false, "medium", "low"].includes(body.think)) throw badRequest('Invalid "think" value.');
+  if (body.web != null && typeof body.web !== "boolean") throw badRequest('"web" must be true or false.');
   const attachments = parseAttachments(body.attachments);
   const pictures = body.pictures_count ?? 0;
   if (!Number.isInteger(pictures) || pictures < 0 || pictures > 4) throw badRequest('"pictures_count" must be from zero to four.');
@@ -154,6 +166,6 @@ export async function previewContext({ env, request, params }) {
   const { numCtx, vision } = serverInfo(env, await readTarget(env.DB));
   const mapped = mappedTranscript(transcript, vision);
   if (body.content || attachments.length || pictures) mapped.push({ role: "user", content: modelContent(body.content ?? "", attachments), pictures_count: pictures + modelImages(attachments).length });
-  const plan = planContext({ transcript: mapped, numCtx, think: body.think ?? true, preferences: await readPreferences(env.DB, env), checkpoint: params.id ? await readCheckpoint(env.DB, params.id) : null, lastMeasured: params.id ? await lastMeasured(env.DB, params.id) : null });
+  const plan = planContext({ transcript: mapped, numCtx, think: body.think ?? true, preferences: await readPreferences(env.DB, env), checkpoint: params.id ? await readCheckpoint(env.DB, params.id) : null, lastMeasured: params.id ? await lastMeasured(env.DB, params.id) : null, toolReserveChars: (body.web ?? true) ? WEB_RESERVE_CHARS : 0 });
   return json({ context: plan.context });
 }

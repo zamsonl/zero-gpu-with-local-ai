@@ -1,5 +1,5 @@
 // The message box: per-chat drafts, a manually resizable textarea, Enter (or Ctrl+Enter) to send,
-// the Think toggle, attached files (button, paste or drop) and a counter for long text. On touch
+// the Think and Web toggles, attached files (button, paste or drop) and a counter for long text. On touch
 // devices Enter adds a line.
 
 import { h, icon, isTouch, storage } from "./dom.js";
@@ -29,6 +29,8 @@ export function isSendKey(event) {
 
 const THINK_KEY = "qwen.think";
 const CHAT_THINK_KEY = THINK_KEY + ".chat:";
+// Web search and page reading, on unless turned off on this device.
+const WEB_KEY = "qwen.web";
 
 /**
  * How much the model reasons before it answers, remembered per chat on this device. `think` is what the API takes: false,
@@ -85,6 +87,7 @@ export class Composer {
     this.input.setAttribute('rows', '2');
     this.send = document.getElementById("send");
     this.thinkButton = document.getElementById("think");
+    this.webButton = document.getElementById("web");
     this.counter = document.getElementById("counter");
     this.hint = document.getElementById("composer-hint");
     this.tray = document.getElementById("attachments");
@@ -92,6 +95,7 @@ export class Composer {
     this.attachButton = document.getElementById("attach");
 
     this.thinkButton.prepend(icon("spark"));
+    this.webButton.prepend(icon("globe"));
     this.attachButton.prepend(icon("attach"));
     this.keys = document.getElementById("keys");
     // Keep the old device preference as the default for new or previously unconfigured chats.
@@ -99,9 +103,18 @@ export class Composer {
     this.effort = this.#defaultEffort;
     this.#efforts.set(this.#draftKey, this.effort);
     this.#syncThink();
+    this.web = storage.get(WEB_KEY) !== "off";
+    this.#syncWeb();
     this.#syncSend();
 
     this.thinkButton.setAttribute("aria-haspopup", "menu");
+    this.webButton.addEventListener("click", () => {
+      if (this.#generating || this.#preparing) return;
+      this.web = !this.web;
+      storage.set(WEB_KEY, this.web ? null : "off");
+      this.#syncWeb();
+      this.focus();
+    });
     this.thinkButton.addEventListener("click", () => this.#openEffortMenu());
     this.attachButton.addEventListener("click", () => this.picker.click());
     this.picker.addEventListener("change", () => {
@@ -419,6 +432,15 @@ export class Composer {
     this.actions.onChange?.();
   }
 
+  #syncWeb() {
+    this.webButton.setAttribute("aria-pressed", String(this.web));
+    this.webButton.querySelector(".web-label").textContent = this.web ? "Web" : "Web off";
+    this.webButton.title = this.web
+      ? "Web search: on. The model can search the web and read pages when it needs to. Click to turn off."
+      : "Web search: off. The model answers from what it knows. Click to turn on.";
+    this.actions.onChange?.();
+  }
+
   /** The effort picker: a small menu of radio items, each with what it trades. */
   #openEffortMenu() {
     if (this.#generating || this.#preparing) return;
@@ -476,6 +498,7 @@ export class Composer {
   #syncSend() {
     this.#syncKeys();
     this.thinkButton.disabled = this.#generating || this.#preparing;
+    this.webButton.disabled = this.#generating || this.#preparing;
     const text = this.input.value.trim();
     const hasFiles = this.#files.length > 0;
     const blockedByFiles = this.#files.some((f) => f.reading) || this.#totalChars() > MAX_TOTAL_CHARS;

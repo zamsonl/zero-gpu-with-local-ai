@@ -12,6 +12,7 @@ import {continuationPrompt,thinkSplitter,sampling} from '../src/prompt.js';
 import {COMPACTION_MEMORY_SCHEMA,parseCompactionMemory,mergeMemory} from '../src/compaction-memory.js';
 import {thinkingWorkBody,validRecovery,interruptedWorkCode,isWorkBudgetError} from '../src/reasoning-recovery.js';
 import {phaseStatus,withTransportProgress,formatProgressStatus} from '../public/js/progress-status.js';
+import * as webTools from '../src/web-tools.js';
 
 const generationSource=(await fs.readFile(new URL('../src/generation.js',import.meta.url),'utf8')).replace(/^import[^\n]*;\r?\n/gm,'').replace(/^export /gm,'');
 const recoverySource=(await fs.readFile(new URL('../src/reasoning-recovery.js',import.meta.url),'utf8')).replace(/^import[^\n]*;\r?\n/gm,'').replace(/^export /gm,'');
@@ -25,7 +26,7 @@ async function generationFixture(mode,{recover,stop=false}={}){
     return new Response(JSON.stringify(first)+'\n'+JSON.stringify(terminal(mode))+'\n');
   };
   const db={},chat={id:'fixture'},lock={startHeartbeat(){},watchForStop(callback){stopped=callback;},async release(){}};
-  const deps={OfflineError,UpstreamError,isContextOverflow,createJobBudget,streamChat,streamTiming,thinkingWorkBody,interruptedWorkCode,isWorkBudgetError,phaseStatus,withTransportProgress,
+  const deps={...webTools,OfflineError,UpstreamError,isContextOverflow,createJobBudget,streamChat,streamTiming,thinkingWorkBody,interruptedWorkCode,isWorkBudgetError,phaseStatus,withTransportProgress,
     EventWriter:class{gone=false;async send(event){events.push(event);if(stop&&event.event==='thinking')stopped();}async close(){}},
     LiveReply:class{update(){}async finish(){}},
     saveAssistantMessage:async(_db,_id,fields)=>({message:saved={id:2,role:'assistant',...fields},chat}),updateAssistantMessage:async(_db,_chat,_id,fields)=>({message:saved={id:2,role:'assistant',...fields},chat}),lastMessage:async()=>saved,

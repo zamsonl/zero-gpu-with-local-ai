@@ -257,6 +257,7 @@ export class AssistantView {
       this.#contentStarted = Boolean(message.content);
       this.#markdown.render(message.content, { final: true });
       this.#renderFooter(message, isLast);
+      this.#renderSources(message.stats?.web);
     }
   }
 
@@ -388,6 +389,7 @@ export class AssistantView {
         this.thinkingMeta.textContent = traceMeta(message.stats);
       }
       this.#renderFooter(message, isLast, errorText);
+      this.#renderSources(message.stats?.web);
     } else {
       this.#renderFooter({ status: "error", content: this.#content, stats: null }, isLast, errorText);
     }
@@ -564,6 +566,14 @@ export class AssistantView {
     this.liveEl = null;
   }
 
+  /** Sources under the answer, when the reply searched the web or read pages. */
+  #renderSources(web) {
+    const list = sourcesList(web);
+    this.sourcesEl?.remove();
+    this.sourcesEl = list;
+    if (list) this.main.insertBefore(list, this.footer);
+  }
+
   #renderFooter(message, isLast, errorText = null) {
     const parts = [];
     const badge = STATUS_BADGES[message.status];
@@ -604,6 +614,73 @@ export class AssistantView {
     // except on the last reply).
     this.footer.replaceChildren(...parts, actions, resume ?? [], finishAnswer ?? []);
   }
+}
+
+const MAX_SOURCES = 8;
+
+/**
+ * The Sources list for `stats.web`: the pages the reply read, then what its searches found (up to
+ * MAX_SOURCES), and what it searched for. Links open in a new tab; only http(s) ones are shown.
+ */
+export function sourcesList(web) {
+  if (!web || typeof web !== "object") return null;
+  const pages = Array.isArray(web.pages) ? web.pages : [];
+  const searches = Array.isArray(web.searches) ? web.searches : [];
+  const items = [];
+  const seen = new Set();
+  const add = (url, title, read) => {
+    const href = webHref(url);
+    if (!href || seen.has(href) || items.length >= MAX_SOURCES) return;
+    seen.add(href);
+    items.push({ href, title: typeof title === "string" && title.trim() ? title.trim() : hostLabel(href), read });
+  };
+  for (const page of pages) add(page?.url, page?.title, true);
+  for (const search of searches) for (const result of Array.isArray(search?.results) ? search.results : []) add(result?.url, result?.title, false);
+  const queries = searches.map((search) => search?.query).filter((query) => typeof query === "string" && query.trim());
+  if (!items.length && !queries.length) return null;
+  return h(
+    "section",
+    { class: "msg-sources", "aria-label": "Sources" },
+    h(
+      "p",
+      { class: "sources-head" },
+      h("span", { class: "sources-title", text: "Sources" }),
+      queries.length ? h("span", { class: "sources-queries", text: "Searched " + queries.map((query) => `“${query.trim()}”`).join(", ") }) : null,
+    ),
+    items.length
+      ? h(
+          "ol",
+          { class: "sources-list" },
+          items.map((item) =>
+            h(
+              "li",
+              { class: "source" },
+              h(
+                "a",
+                { class: "source-link", href: item.href, target: "_blank", rel: "noopener noreferrer", title: item.href },
+                h("span", { class: "source-title", text: item.title }),
+                h("span", { class: "source-host", text: hostLabel(item.href) + (item.read ? " · read" : "") }),
+              ),
+            ),
+          ),
+        )
+      : null,
+  );
+}
+
+/** Only http(s) links reach the page; javascript:, data: and the like are dropped. */
+function webHref(url) {
+  if (typeof url !== "string") return null;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function hostLabel(href) {
+  return new URL(href).hostname.replace(/^www\./, "");
 }
 
 /** "Reasoned for 14 s", from the server's measurement, or plain "Reasoning" without one. */

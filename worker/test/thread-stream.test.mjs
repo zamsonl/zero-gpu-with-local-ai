@@ -161,6 +161,7 @@ const composerSource=(await fs.readFile(new URL('../public/js/composer.js',impor
 test('reasoning effort controls stay fixed during generation/preparation and apply cleanly afterward',()=>{
   const nodes=new Map();const get=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
   const label=new Element('span');label.className='think-label';get('think').append(label);
+  const webLabel=new Element('span');webLabel.className='web-label';get('web').append(webLabel);
   const h=(tag,attrs={},...children)=>{const node=new Element(tag);for(const[key,value]of Object.entries(attrs)){if(key==='class')node.className=value;else if(key==='text')node.textContent=value;else node[key]=value;}node.append(...children);return node;};
   let menu=null,opened=0;
   const make=new Function('h','icon','isTouch','storage','closePopover','openPopover','prefs','window','document','MAX_TOTAL_CHARS',composerSource+'\nreturn {Composer,EFFORTS};');
@@ -171,7 +172,7 @@ test('reasoning effort controls stay fixed during generation/preparation and app
   const quick=menu.children.find(node=>node.tagName==='BUTTON'&&node.dataset.effort==='low');
   composer.setGenerating(true);assert.equal(get('think').disabled,true);get('think').listeners.click();assert.equal(opened,1);quick.listeners.click();assert.equal(composer.think,'medium');
   composer.setGenerating(false);assert.equal(get('think').disabled,false);quick.listeners.click();assert.equal(composer.think,'low');
-  composer.setPreparing(true);assert.equal(get('think').disabled,true);composer.setPreparing(false);assert.equal(get('think').disabled,false);
+  composer.setPreparing(true);assert.equal(get('think').disabled,true);assert.equal(get('web').disabled,true);composer.setPreparing(false);assert.equal(get('think').disabled,false);assert.equal(get('web').disabled,false);
 });
 
 test('ordinary Continue preserves the composer Off choice all the way to its API request',async()=>{
